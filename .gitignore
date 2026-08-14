@@ -1,0 +1,29 @@
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local helper, machine-specific identity and remote — see README.
+commit.sh
+
+# Scratch space: the 2D prototype this repo grew out of lives here and is not published.
+tmp/
+
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+*.so
+*.o
+*.dylib
+
+outputs/
+runs/
+data/
+*.wav
+*.npz
+*.h5
