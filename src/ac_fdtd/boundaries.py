@@ -61,6 +61,7 @@ __all__ = [
     "WallAdmittances",
     "admittance_from_absorption",
     "layer_factors",
+    "random_incidence_absorption",
     "reflection_coefficient",
     "wall_update_coefficients",
 ]
@@ -83,10 +84,34 @@ def admittance_from_absorption(absorption: float) -> float:
     return (1.0 - reflection) / (1.0 + reflection)
 
 
-def reflection_coefficient(normalised_admittance: float) -> float:
-    """Pressure reflection coefficient of that wall at normal incidence."""
+def reflection_coefficient(normalised_admittance: float, angle: float = 0.0) -> float:
+    """Pressure reflection coefficient of that wall, at an angle from the normal in radians."""
     xi = normalised_admittance
-    return (1.0 - xi) / (1.0 + xi)
+    cosine = math.cos(angle)
+    return (cosine - xi) / (cosine + xi)
+
+
+def random_incidence_absorption(normalised_admittance: float, n_angles: int = 1024) -> float:
+    """Absorption coefficient averaged over all angles of incidence, by the Paris formula.
+
+    ``alpha_random = integral of alpha(theta) sin(2 theta) d theta`` over a quarter turn.
+
+    **This is the number the Sabine and Eyring formulae want, and it is not the number in an
+    absorption table.** A locally reacting surface absorbs considerably more at oblique
+    incidence than head-on — for a wall quoted at 0.15 normal-incidence, the random-incidence
+    figure is 0.25, and the predicted reverberation time differs by a factor of 1.7. Comparing a
+    simulated decay against Sabine fed with the normal-incidence coefficient makes a correct
+    simulation look twice as absorbent as it should be.
+
+    The integral is done numerically rather than by one of the closed-form approximations in
+    circulation, because those hold in the small-admittance limit and it is not obvious from a
+    call site whether that limit applies.
+    """
+    angles = (np.arange(n_angles) + 0.5) * (math.pi / 2.0) / n_angles
+    cosines = np.cos(angles)
+    reflection = (cosines - normalised_admittance) / (cosines + normalised_admittance)
+    absorption = 1.0 - reflection**2
+    return float(np.trapezoid(absorption * np.sin(2.0 * angles), angles))
 
 
 @dataclass(frozen=True)

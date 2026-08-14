@@ -180,6 +180,7 @@ class AcousticFDTD:
         self._scratch = np.empty(grid.shape, dtype=self.dtype)
 
         self._sources: list[tuple[tuple[int, int, int], np.ndarray]] = []
+        self._receivers: list[tuple[tuple[int, int, int], list[float]]] = []
 
         # Absorbing walls: the two coefficients of the closed-form solve, on the boundary cells
         # only. Empty arrays when every wall is rigid, and then the whole mechanism costs one
@@ -276,6 +277,29 @@ class AcousticFDTD:
         index = self.grid.cell_index(point)
         self._sources.append((index, np.asarray(signal, dtype=self.dtype)))
 
+    def add_pressure_receiver(self, point: tuple[float, float, float]) -> int:
+        """Record the pressure at ``point`` every step from now on, and return its channel.
+
+        Sample ``n`` of the recording is the pressure at ``(n + 1) dt``: the field after the
+        first step taken once the receiver existed. Receivers added part-way through a run are
+        therefore shorter than the others, which is deliberate — silently padding them would
+        put the recordings on different time bases without saying so.
+        """
+        self._receivers.append((self.grid.cell_index(point), []))
+        return len(self._receivers) - 1
+
+    @property
+    def recorded_pressure(self) -> np.ndarray:
+        """Everything the receivers have recorded, as ``(channel, sample)``."""
+        if not self._receivers:
+            return np.zeros((0, 0))
+        return np.array([samples for _, samples in self._receivers])
+
+    @property
+    def sample_rate(self) -> float:
+        """Rate the recordings are at, in Hz. Set by the Courant condition, not by choice."""
+        return 1.0 / self.dt
+
     def probe_pressure(self, point: tuple[float, float, float]) -> float:
         """Pressure at ``point``, at time :attr:`time`, in Pa."""
         return float(self.p[self.grid.cell_index(point)])
@@ -302,6 +326,8 @@ class AcousticFDTD:
         self._damp(self.p, self._pressure_damping)
         self._inject_sources()
         self.step_index += 1
+        for index, samples in self._receivers:
+            samples.append(self.p[index])
 
     @staticmethod
     def _damp(field: np.ndarray, slabs) -> None:

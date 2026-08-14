@@ -9,9 +9,9 @@ an exact answer exists.
 
 ## Status
 
-**M3 — physics complete, performance next.** Rectangular rooms, absorbing walls, free field via
-an absorbing layer, ISO 9613-1 air absorption; NumPy only. Sources/receivers/metrics and the
-fast backends are the milestones that follow.
+**M4 — physics complete, performance next.** Rectangular rooms, absorbing walls, free field via
+an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
+usual room-acoustics parameters. NumPy only — the fast backends are what remain.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -50,6 +50,21 @@ only. Beating −30 dB means a true PML, and −30 dB is the number it has to be
 The relaxation strengths come from the ISO coefficients by matching terms, so there is no
 fitting step and no free parameter. Two extra fields, about ten flops per cell.
 
+![Reverberation time against Sabine and Eyring](docs/figures/m4_reverberation.svg)
+
+| octave band | simulated T20 | Sabine | Eyring |
+| --- | --- | --- | --- |
+| 125 Hz | 0.335 ± 0.019 s | 0.286 | 0.248 |
+| 250 Hz | 0.266 ± 0.038 s | 0.285 | 0.248 |
+| 500 Hz | 0.261 ± 0.035 s | 0.285 | 0.247 |
+| 1000 Hz | 0.267 ± 0.026 s | 0.284 | 0.247 |
+
+Above the Schroeder frequency (223 Hz for this room) the simulation lands between Eyring and
+Sabine, within 6–8 % of Eyring. The 125 Hz band is 35 % away, and that is the right answer:
+below the Schroeder frequency a room is a few separately decaying modes, not a diffuse field,
+and Sabine's derivation does not apply there. Agreement in that band would mean the simulation
+was reproducing the formula instead of the physics.
+
 ## Quickstart
 
 ```bash
@@ -58,7 +73,25 @@ uv run pytest
 uv run python scripts/validate_box.py         # regenerates the first figure
 uv run python scripts/validate_boundaries.py  # the second (about two minutes)
 uv run python scripts/validate_air_absorption.py
+uv run python scripts/validate_reverberation.py  # also writes a wav you can listen to
 ```
+
+A room impulse response, start to finish:
+
+```python
+from ac_fdtd import Room, simulate_impulse_response, write_wav
+
+room = Room(dimensions=(5.0, 4.0, 3.0), absorption=0.15)
+response = simulate_impulse_response(
+    room,
+    source=(1.0, 1.0, 1.2),
+    receivers=[(3.5, 2.5, 1.4)],
+    max_frequency=1000.0,
+)
+write_wav("room.wav", response.signals, response.sample_rate)
+```
+
+Or drive the scheme directly, which is what anything unusual should do:
 
 ```python
 from ac_fdtd import AIR, AcousticFDTD, AirAbsorption, Grid, WallAdmittances
@@ -71,6 +104,7 @@ solver = AcousticFDTD(
     air_absorption=AirAbsorption(temperature=20.0, relative_humidity=50.0),
 )
 solver.add_volume_source((1.0, 1.0, 1.2), signal)
+solver.add_pressure_receiver((3.5, 2.5, 1.4))
 solver.run(1000)
 ```
 

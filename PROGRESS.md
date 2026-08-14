@@ -317,3 +317,74 @@ slope and a bound on accumulated high-frequency numerical energy.
 
 M4: sources, receivers, impulse-response export and the room-acoustics metrics — the first
 milestone whose output is a file someone can listen to.
+
+---
+
+## M4 — Impulse responses and room acoustics
+
+Excitation, receivers, deconvolution, wav export, and the standard parameters — plus rung 4 of
+the validation ladder, which is the first one whose reference is not exact.
+
+### Design decisions
+
+**Band-limited excitation, then deconvolution.** A unit impulse is flat to Nyquist, and the top
+of that range is where the grid is worst — a response excited that way is not visibly wrong, it
+just has a smeared top end with nothing in the output to say so. The excitation is a windowed
+sinc flat to a stated `max_frequency`, divided back out afterwards, and the response is exactly
+zero above that limit because above it the grid was not asked to be right.
+
+**No swept sines.** Sweeps exist to buy signal-to-noise ratio against background noise and to
+push distortion out of the measurement window. A simulation is silent between arrivals and
+exactly linear, so a sweep would be ceremony at several times the run length.
+
+**Schroeder integration runs to the end of the response.** Real analysis needs a truncation
+point because the tail of a measurement is noise, not decay. A simulated response decays into
+round-off, so the integration is exact and none of that machinery is needed. The absence is a
+property of the input, not a simplification.
+
+### Results
+
+![M4 validation](docs/figures/m4_reverberation.svg)
+
+Room 3.2 x 2.7 x 2.3 m (19.9 m³), walls at 0.15 normal-incidence absorption, 20 °C / 50 % RH,
+grid 108 x 91 x 78 at 29.6 mm, 2 sources x 4 receivers:
+
+| octave band | simulated T20 | Sabine | Eyring | vs Eyring |
+| --- | --- | --- | --- | --- |
+| 125 Hz | 0.335 ± 0.019 s | 0.286 | 0.248 | **+35 %** |
+| 250 Hz | 0.266 ± 0.038 s | 0.285 | 0.248 | +7.4 % |
+| 500 Hz | 0.261 ± 0.035 s | 0.285 | 0.247 | +5.6 % |
+| 1000 Hz | 0.267 ± 0.026 s | 0.284 | 0.247 | +8.4 % |
+
+Above the Schroeder frequency (223 Hz) the simulation sits between Eyring and Sabine, nearer
+Eyring, within 6–8 %. That is as close as statistical theory gets to a real room, and closer
+than the spread between source-receiver positions in a measurement.
+
+The 125 Hz band is 35 % away, and **that is the correct answer**. The Schroeder frequency is
+223 Hz; below it a room is a handful of separately decaying modes rather than a diffuse field,
+and Sabine's derivation does not apply. The small spread across the eight positions (± 0.019 s)
+confirms it is a property of the room and not measurement scatter. Agreement in that band would
+have meant the simulation was reproducing the formula rather than the physics.
+
+### The trap that cost the most here
+
+**The absorption coefficient in Sabine's formula is the random-incidence one, and a wall
+admittance is defined at normal incidence.** A locally reacting surface absorbs considerably
+more obliquely than head-on: a wall quoted at 0.15 normal-incidence is 0.252 averaged over
+angle, and the predicted reverberation time differs by a factor of 1.7. The first run of this
+comparison showed a "measured" T60 of half the predicted value and looked like a serious bug in
+the boundaries. The boundaries were right; the comparison was wrong. `Room.diffuse_absorption`
+now does the Paris integral, and `Room.sabine_reverberation_time` uses it.
+
+A second, smaller one: decay rates are measured on the **raw recording**, not the deconvolved
+response. Deconvolution leaves a broadband residue where the excitation had little energy; that
+residue never decays, so the backward integral flattens onto it and a T30 fit reports the noise
+floor as a reverberation time — 5.1 s in the first attempt. The excitation is a few
+milliseconds long, so using the raw recording costs only the first few milliseconds of the
+decay curve, which the fit already excludes.
+
+### Next
+
+M5: the PyTorch backend. The physics is complete enough to be worth running fast — the room
+above took 130 s for 0.45 s of response at 1.45 kHz, and every extra octave of bandwidth costs
+a factor of sixteen.
