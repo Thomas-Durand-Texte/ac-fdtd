@@ -54,9 +54,11 @@ first-order system buys is everything else in this plan: impedance boundaries, P
 relaxation states of the air model all attach naturally to it.
 
 **Air absorption.** Implemented as two auxiliary relaxation states (O2, N2) plus a classical
-term, fitted to the ISO 9613-1 attenuation curve. Cost is +2 cell-sized fields and ~10 flops
-per cell. To be clear about what this buys: at 20 °C and 50 % RH the attenuation is about
-0.02 dB/m at 4 kHz, so over a 20 m path it is a fraction of a decibel. It is **not** a
+term. Not *fitted* to the ISO 9613-1 curve — a relaxing fluid has exactly the ISO functional
+form, so the strengths follow by matching coefficients, with no free parameter. Cost is two
+cell-sized fields and ~10 flops per cell. To be clear about what this buys: at 20 °C and 50 %
+RH the attenuation is about 0.02 dB/m at 4 kHz, so over a 20 m path it is a fraction of a
+decibel. It is **not** a
 stability mechanism — stability comes from the Courant condition and from energy-passive
 boundary formulations. What it buys is a physically correct high-frequency decay slope, which
 matters for T60 in large volumes, and a bound on accumulated high-frequency numerical energy.
@@ -70,7 +72,8 @@ matters for T60 in large volumes, and a bound on accumulated high-frequency nume
    dispersion, and the reflection level of the absorbing boundary in dB. *(M2, done: 0.21 % at
    61 points per wavelength; layer at −17 to −31 dB depending on receiver clearance.)*
 3. **Air absorption** against the ISO 9613-1 curve, measured from spectral decay along a duct;
-   target better than 5 % over 100 Hz – 8 kHz.
+   target better than 5 % over 100 Hz – 8 kHz. *(M3, done: within 1.2 % wherever the grid gives
+   20 points per wavelength, across 20–80 % relative humidity.)*
 4. **T60** against Sabine and Eyring for uniform wall absorption — a statistical check, with
    the limits of statistical theory stated rather than glossed.
 5. **Measured room IR**, if one is available from the `ir-estimation` work.
@@ -102,7 +105,7 @@ points per wavelength is worth more than any backend choice.
 | M0 | Scaffold, CI, commit script | done |
 | M1 | NumPy core, energy and modal validation | done |
 | M2 | Boundaries: admittance, ABC, absorbing layer + Green's function test | done |
-| M3 | Air absorption + ISO 9613-1 validation | |
+| M3 | Air absorption + ISO 9613-1 validation | done |
 | M4 | Sources, receivers, IR export, room acoustics metrics | |
 | M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | |
 | M6 | C/OpenMP backend + parity tests | |

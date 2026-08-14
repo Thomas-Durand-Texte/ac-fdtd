@@ -232,3 +232,88 @@ read back from the indices rather than from the request.
 
 Neither was caught by a test. Both were caught by comparing against a closed-form answer, which
 is the argument for having one.
+
+---
+
+## M3 — Air absorption
+
+ISO 9613-1 attenuation, as a property of the simulated medium rather than a post-processing
+filter.
+
+### Design decisions
+
+**No fitting step.** The ISO formula is a sum of a classical `f^2` term and two relaxation
+terms of the form `C f^2 F / (F^2 + f^2)`. A relaxing fluid with one auxiliary field per
+process has exactly that attenuation:
+
+```
+dp/dt = -rho c_inf^2 div v + sum_nu psi_nu
+tau_nu dpsi_nu/dt + psi_nu = rho c_0^2 Delta_nu div v
+
+  =>  alpha_nu(f) = (pi Delta_nu / c) f^2 F_nu / (F_nu^2 + f^2)
+```
+
+so the strengths follow by matching coefficients: `Delta_nu = C_nu c / pi`, with `C_nu` read
+straight out of the standard. There is no curve fit and no free parameter. Cost is two extra
+cell-sized fields and about ten flops per cell.
+
+**The classical term's relaxation frequency is the Nyquist frequency of `dt`.** An `f^2` law is
+a relaxation with `F` at infinity, which a grid cannot have. Placing it at Nyquist makes the
+term indistinguishable from `f^2` across the resolved band and roll off above it instead of
+growing — the right way to be wrong in a band the scheme cannot represent anyway.
+
+**The relaxation states are integrated exactly, not by a difference formula.** The oxygen
+process has `tau` of a few microseconds, which is *shorter than `dt`* on any ordinary grid. The
+trapezoidal rule is stable there but rings at Nyquist; the exponential form
+`psi <- e^{-dt/tau} psi + (1 - e^{-dt/tau}) G` is exact in that limit and simply pins the state
+to its target. The pressure update takes the exact mean of that solution over the step rather
+than the endpoint average, which costs one precomputed constant and removes a half-step lag.
+
+**`Medium.sound_speed` is the unrelaxed speed.** Relaxation makes sound speed frequency
+dependent — here by 0.05 % between the low- and high-frequency limits. The time step is derived
+from the fast one, so reading it as the low-frequency speed would make the Courant number
+0.05 % larger than requested, which at the stability limit is not a rounding difference.
+
+### Results
+
+![M3 validation](docs/figures/m3_air_absorption.svg)
+
+A pulse down a 20 m duct at `dx = 2 mm`, recorded 16 m apart and differenced. The measurement
+works because dispersion changes a spectrum's phase and not its magnitude, so the ratio of two
+magnitude spectra sees the attenuation alone.
+
+Measured attenuation against the standard, dB/km at 20 °C:
+
+| f [Hz] | 20 % RH | | 50 % RH | | 80 % RH | |
+| --- | --- | --- | --- | --- | --- | --- |
+| | measured | ISO | measured | ISO | measured | ISO |
+| 1000 | 6.59 | 6.53 | 4.72 | 4.66 | 5.22 | 5.15 |
+| 2000 | 21.52 | 21.55 | 9.89 | 9.89 | 9.02 | 9.00 |
+| 4000 | 74.76 | 74.71 | 29.64 | 29.67 | 21.38 | 21.41 |
+| 8000 | 218.44 | 217.13 | 105.83 | 105.29 | 69.81 | 69.49 |
+| 16000 | 446.97 | 434.54 | 375.31 | 364.54 | 259.52 | 252.17 |
+
+**Within 1.2 % of ISO 9613-1 wherever the grid gives at least 20 points per wavelength**, and
+within 3 % down to 11. Note that the three humidities span a factor of three in attenuation at
+8 kHz and the model tracks all of them — matching the *dependence* is a much stronger claim
+than matching one curve, and the humidity dependence is where a hand-tuned damping constant
+would come apart.
+
+The residual error is independent of humidity, which is the tell that what is left is the grid
+rather than the air.
+
+### What it is worth, stated plainly
+
+At 20 °C and 50 % RH, air absorption reaches 1 dB after 12 m at 8 kHz, 5 m at 12 kHz, and
+100 m at 2 kHz. So for a room it is a top-octave effect on the late decay, and for anything
+outdoors or in a large hall it is not optional.
+
+It is **not** a stability mechanism, and it was never expected to be. Nothing about these
+numbers rescues a run that would otherwise diverge; stability comes from the Courant condition
+and from passive boundaries. What absorption buys is a physically correct high-frequency decay
+slope and a bound on accumulated high-frequency numerical energy.
+
+### Next
+
+M4: sources, receivers, impulse-response export and the room-acoustics metrics — the first
+milestone whose output is a file someone can listen to.

@@ -1,5 +1,6 @@
 """3D acoustic FDTD: room responses from a staggered pressure–velocity scheme."""
 
+from .air import AirAbsorption
 from .analytic import discrete_mode_frequency, mode_frequency, mode_initial_state
 from .boundaries import (
     AbsorbingLayer,
@@ -14,6 +15,7 @@ from .scheme import AcousticFDTD
 __all__ = [
     "AIR",
     "AbsorbingLayer",
+    "AirAbsorption",
     "AcousticFDTD",
     "Grid",
     "Medium",

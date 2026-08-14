@@ -9,9 +9,9 @@ an exact answer exists.
 
 ## Status
 
-**M2 — the core and its boundaries are in and validated.** Rectangular rooms, absorbing walls,
-free field via an absorbing layer; NumPy only. Air absorption and the fast backends are the
-milestones that follow.
+**M3 — physics complete, performance next.** Rectangular rooms, absorbing walls, free field via
+an absorbing layer, ISO 9613-1 air absorption; NumPy only. Sources/receivers/metrics and the
+fast backends are the milestones that follow.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -39,6 +39,17 @@ The layer result is the one to read carefully: doubling its thickness buys 3 dB,
 the receiver 30 cells further from it buys 14. A matched layer is matched at normal incidence
 only. Beating −30 dB means a true PML, and −30 dB is the number it has to beat.
 
+![Validation of air absorption](docs/figures/m3_air_absorption.svg)
+
+| Check | Result |
+| --- | --- |
+| Measured attenuation vs ISO 9613-1 | within 1.2 % above 20 points/wavelength, 3 % at 11 |
+| Humidity dependence, 20–80 % RH | tracked across a factor of three at 8 kHz |
+| Residual error vs humidity | independent of it — what is left is the grid, not the air |
+
+The relaxation strengths come from the ISO coefficients by matching terms, so there is no
+fitting step and no free parameter. Two extra fields, about ten flops per cell.
+
 ## Quickstart
 
 ```bash
@@ -46,13 +57,19 @@ uv sync --extra dev
 uv run pytest
 uv run python scripts/validate_box.py         # regenerates the first figure
 uv run python scripts/validate_boundaries.py  # the second (about two minutes)
+uv run python scripts/validate_air_absorption.py
 ```
 
 ```python
-from ac_fdtd import AIR, AcousticFDTD, Grid, WallAdmittances
+from ac_fdtd import AIR, AcousticFDTD, AirAbsorption, Grid, WallAdmittances
 
 grid = Grid.from_max_frequency((5.0, 4.0, 3.0), max_frequency=1000.0, sound_speed=AIR.sound_speed)
-solver = AcousticFDTD(grid, medium=AIR, walls=WallAdmittances.from_absorption(0.15))
+solver = AcousticFDTD(
+    grid,
+    medium=AIR,
+    walls=WallAdmittances.from_absorption(0.15),
+    air_absorption=AirAbsorption(temperature=20.0, relative_humidity=50.0),
+)
 solver.add_volume_source((1.0, 1.0, 1.2), signal)
 solver.run(1000)
 ```

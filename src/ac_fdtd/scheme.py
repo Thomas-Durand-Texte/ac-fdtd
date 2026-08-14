@@ -44,8 +44,11 @@ necessarily show up in a picture of the field.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
+from .air import AirAbsorption
 from .boundaries import (
     AbsorbingLayer,
     WallAdmittances,
@@ -143,6 +146,7 @@ class AcousticFDTD:
         dtype: np.dtype = np.float64,
         walls: WallAdmittances | None = None,
         absorbing_layer: AbsorbingLayer | None = None,
+        air_absorption: AirAbsorption | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -152,6 +156,7 @@ class AcousticFDTD:
         self.courant = courant
         self.walls = walls or WallAdmittances()
         self.absorbing_layer = absorbing_layer
+        self.air_absorption = air_absorption
         self.dtype = np.dtype(dtype)
         self.dt = courant * max_stable_time_step(grid.dx, medium.sound_speed)
 
@@ -183,6 +188,40 @@ class AcousticFDTD:
         self._wall_indices = indices
         self._wall_from_updated = (1.0 / (1.0 + coefficient)).astype(self.dtype)
         self._wall_from_previous = (coefficient / (1.0 + coefficient)).astype(self.dtype)
+
+        # Air absorption: one auxiliary field per relaxation process, integrated exactly over
+        # the step rather than with a difference formula. The oxygen process has a relaxation
+        # time of a few microseconds, which is *shorter than dt* on any ordinary grid; the
+        # trapezoidal rule is stable there but rings at the Nyquist frequency, while the
+        # exponential form is exact in that limit and simply pins the state to its target.
+        self._relaxation: list[tuple[np.ndarray, float, float, float]] = []
+        self._relaxation_scratch = None
+        if air_absorption is not None:
+            processes = air_absorption.processes(medium.sound_speed, self.dt)
+            relaxed_speed_squared = medium.sound_speed**2 / (
+                1.0 + sum(process.strength for process in processes)
+            )
+            for process in processes:
+                decay = math.exp(-self.dt / process.relaxation_time)
+                # Mean of the exact solution over the step, as a weight on the initial offset
+                # from the target. Using the endpoint average instead would lag the damping by
+                # half a step -- harmless here, but free to get right.
+                mean_weight = (process.relaxation_time / self.dt) * (1.0 - decay)
+                gain = medium.density * relaxed_speed_squared * process.strength / grid.dx
+                self._relaxation.append(
+                    (
+                        np.zeros(grid.shape, dtype=self.dtype),
+                        self.dtype.type(decay),
+                        self.dtype.type(self.dt * mean_weight),
+                        self.dtype.type(gain),
+                    )
+                )
+            self._relaxation_scratch = np.empty(grid.shape, dtype=self.dtype)
+        # The part of every process's step-average that is proportional to the divergence is
+        # the same shape for all of them, so it is summed once instead of per process.
+        self._relaxation_target_scale = self.dtype.type(
+            self.dt * sum(gain for _, _, _, gain in self._relaxation)
+        )
 
         # Absorbing layer: 1D factors applied only to the slabs where they differ from one.
         self._pressure_damping = []
@@ -289,6 +328,8 @@ class AcousticFDTD:
             component = self.velocity[axis]
             np.subtract(component[_upper(axis)], component[_lower(axis)], out=self._scratch)
             divergence += self._scratch
+        self._advance_relaxation(divergence)
+
         divergence *= self._pressure_coefficient
         self.p -= divergence
 
@@ -300,6 +341,29 @@ class AcousticFDTD:
                 flat[self._wall_indices] * self._wall_from_updated
                 - previous_at_walls * self._wall_from_previous
             )
+
+    def _advance_relaxation(self, divergence: np.ndarray) -> None:
+        """Step each relaxation state and add its contribution to the pressure.
+
+        Takes the *unscaled* divergence sum, before the pressure coefficient is folded in, and
+        must therefore run before that multiplication rather than after it.
+        """
+        target = self._scratch
+        offset = self._relaxation_scratch
+        for state, decay, mean_weight, gain in self._relaxation:
+            np.multiply(divergence, gain, out=target)
+            np.subtract(state, target, out=offset)
+
+            np.multiply(offset, decay, out=state)
+            state += target
+
+            np.multiply(offset, mean_weight, out=offset)
+            self.p += offset
+
+        if self._relaxation:
+            # The remaining piece of the step-average, dt * target, folded in once.
+            np.multiply(divergence, self._relaxation_target_scale, out=target)
+            self.p += target
 
     def _inject_sources(self) -> None:
         for index, signal in self._sources:
