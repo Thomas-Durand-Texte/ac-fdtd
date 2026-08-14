@@ -9,9 +9,10 @@ an exact answer exists.
 
 ## Status
 
-**M4 — physics complete, performance next.** Rectangular rooms, absorbing walls, free field via
-an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
-usual room-acoustics parameters. NumPy only — the fast backends are what remain.
+**M5 — physics complete, PyTorch backend in.** Rectangular rooms, absorbing walls, free field
+via an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
+usual room-acoustics parameters, and a GPU path that is 14x the NumPy reference. The C backend
+and the full benchmark are what remain.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -106,6 +107,28 @@ solver = AcousticFDTD(
 solver.add_volume_source((1.0, 1.0, 1.2), signal)
 solver.add_pressure_receiver((3.5, 2.5, 1.4))
 solver.run(1000)
+```
+
+### Backends
+
+| grid | NumPy fp64 | Torch CPU fp32 | MPS fp32 |
+| --- | --- | --- | --- |
+| 64³ | 0.19 | 0.17 | 0.67 |
+| 256³ | 0.20 | 1.22 | 2.78 |
+| 320³ | 0.20 | 1.79 | 2.80 |
+
+Billions of cell-updates per second, on an M2 Ultra. In double precision on the CPU, the
+PyTorch backend agrees with the NumPy reference **bitwise**, for every combination of walls,
+absorbing layer and air absorption.
+
+Two results worth knowing before choosing a backend. At 64³ PyTorch on the CPU is *slower* than
+NumPy — small arrays make dispatching an operation cost more than performing it, and that
+regime ends by 128³. And single precision costs a noise floor at −112 dB relative to the peak
+that does not grow with run length, so for this scheme fp32 is free; MPS, which has no float64
+at all, is not giving anything up.
+
+```bash
+uv sync --extra torch   # the GPU path is an optional extra
 ```
 
 ## Two things worth knowing before reading the code

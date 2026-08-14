@@ -60,11 +60,14 @@ __all__ = [
     "AbsorbingLayer",
     "WallAdmittances",
     "admittance_from_absorption",
+    "edge_slabs",
     "layer_factors",
     "random_incidence_absorption",
     "reflection_coefficient",
     "wall_update_coefficients",
 ]
+
+_AXES_ = (0, 1, 2)
 
 #: Order of the faces everywhere in this module: (axis, side), side 0 = low, 1 = high.
 FACES = ((0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1))
@@ -278,3 +281,38 @@ def layer_factors(
         velocity_factors.append(per_axis)
 
     return pressure_factors, velocity_factors
+
+
+def edge_slabs(factor: np.ndarray, axis: int) -> list[tuple[tuple[slice, ...], np.ndarray]]:
+    """Split a 1D damping profile into the slabs where it actually damps.
+
+    The profile is one everywhere except within the absorbing layer at each end, so multiplying
+    the whole field by it would be three full passes over memory to change a shell. Each
+    returned pair is an index into the field and the factor to multiply that slab by, already
+    shaped to broadcast.
+    """
+    damping = factor < 1.0
+    if not damping.any():
+        return []
+
+    def broadcast(values: np.ndarray) -> np.ndarray:
+        shape = [1, 1, 1]
+        shape[axis] = -1
+        return values.reshape(shape)
+
+    def index(span: slice) -> tuple[slice, ...]:
+        return tuple(span if a == axis else slice(None) for a in _AXES_)
+
+    if damping.all():
+        return [(index(slice(None)), broadcast(factor))]
+
+    count = factor.size
+    leading = int(np.argmin(damping)) if damping[0] else 0
+    trailing = int(np.argmin(damping[::-1])) if damping[-1] else 0
+
+    slabs = []
+    if leading:
+        slabs.append((index(slice(0, leading)), broadcast(factor[:leading])))
+    if trailing:
+        slabs.append((index(slice(count - trailing, None)), broadcast(factor[count - trailing :])))
+    return slabs

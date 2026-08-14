@@ -388,3 +388,84 @@ decay curve, which the fit already excludes.
 M5: the PyTorch backend. The physics is complete enough to be worth running fast — the room
 above took 130 s for 0.45 s of response at 1.45 kHz, and every extra octave of bandwidth costs
 a factor of sixteen.
+
+---
+
+## M5 — The PyTorch backend
+
+The same scheme on CPU, MPS or CUDA, in single or double precision.
+
+### Design decisions
+
+**Only the ten lines that move numbers are written twice.** Everything that decides *what* the
+scheme does — wall coefficients, layer profiles, relaxation strengths, the time step — comes
+from the same shared functions the reference uses. A second copy of the physics would be a
+second thing to get wrong, and no parity test would catch a shared misunderstanding.
+
+**Receiver samples never leave the device during a run.** Reading one value per step back to
+the host forces a synchronisation every step and throws away everything the device gained. The
+recording is a tensor on the device, copied back once when asked for. The same applies to
+source signals, which are uploaded once rather than fed a scalar at a time.
+
+**MPS is rejected for float64 with an explanation rather than a cast.** The device has no
+double-precision support at all. Silently demoting the request would make a run quietly less
+accurate than asked for.
+
+### Results
+
+**Parity.** In double precision on the CPU, the PyTorch backend agrees with the NumPy reference
+**bitwise** — a maximum absolute difference of exactly zero in the pressure field, the velocity
+fields, the receiver recordings and the energy — for every combination of features: rigid box,
+absorbing walls, absorbing layer, air absorption, and all three at once. The tests assert
+`rtol=1e-10` rather than exact equality, since bitwise agreement depends on the platform's
+libm and vectorisation, but on this machine it is exact.
+
+**Throughput**, in billions of cell-updates per second, absorbing walls, single source:
+
+| grid | cells | NumPy fp64 | Torch CPU fp64 | Torch CPU fp32 | MPS fp32 | MPS vs NumPy |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64³ | 0.3 M | 0.19 | **0.15** | 0.17 | 0.67 | 3.5x |
+| 128³ | 2.1 M | 0.20 | 0.57 | 0.79 | 1.96 | 10.0x |
+| 192³ | 7.1 M | 0.18 | 0.69 | 0.99 | 2.68 | 14.9x |
+| 256³ | 16.8 M | 0.20 | 0.92 | 1.22 | 2.78 | 14.0x |
+| 320³ | 32.8 M | 0.20 | 0.91 | 1.79 | 2.80 | 13.8x |
+
+The bold entry is the interesting one: **at 64³, PyTorch on the CPU is slower than NumPy.** That
+is the kernel-launch-bound regime the companion `plate-fdtd` project lived in entirely — the
+arrays are small enough that dispatching an operation costs more than performing it. It is
+gone by 128³, and by 256³ the hardware's bandwidth is the only thing that matters. Anyone
+porting the `plate-fdtd` conclusion to this repository would have got the answer backwards,
+which is why it was re-measured rather than assumed.
+
+For scale: as a bandwidth ceiling, a plain fused add over 16.8 M float32 elements runs at
+306 GB/s on the CPU through PyTorch's threads and 727 GB/s on MPS. NumPy is single-threaded and
+sits at about 17 GB/s, which is what the flat 0.2 GCUPS across every grid size is really saying.
+
+**What single precision costs.** Against the double-precision reference, over a 20 000-step run
+in a live room (α = 0.05):
+
+| steps | fp32 error at the receiver, relative to the peak |
+| --- | --- |
+| 1 000 | 2.62e-06 (−111.6 dB) |
+| 5 000 | 2.62e-06 (−111.6 dB) |
+| 20 000 | 2.62e-06 (−111.6 dB) |
+
+It does not grow with run length. fp32 puts a noise floor at about **−112 dB relative to the
+peak** and leaves it there, which is 50 dB below the bottom of a T30 fit and far below anything
+audible. For this scheme, on this problem, single precision is free — the opposite of the
+finding in `plate-fdtd`, where fp32 broke down at fine grids because the biharmonic operator's
+condition number grows as `dx^-4`. First-order acoustics has no such term.
+
+### A gap worth naming
+
+CI does not install PyTorch, so the parity tests **skip** on GitHub Actions and only run
+locally. Adding a 900 MB CUDA-flavoured wheel to every CI run to test a CPU code path is a poor
+trade, but the consequence is that a change breaking parity would go green upstream. Anything
+touching either backend needs `uv sync --extra torch && uv run pytest` locally first.
+
+### Next
+
+M6: the C backend. MPS saturates at 2.8 GCUPS, which is about 60 % of what its measured
+bandwidth ceiling allows — the gap is probably the strided slice access the scheme is written
+in. A compiled loop that fuses the whole step into one pass over memory is the natural
+comparison, and it is also the one that will say whether the remaining 40 % is reachable.

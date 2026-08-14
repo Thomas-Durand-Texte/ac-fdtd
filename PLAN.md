@@ -109,7 +109,7 @@ points per wavelength is worth more than any backend choice.
 | M2 | Boundaries: admittance, ABC, absorbing layer + Green's function test | done |
 | M3 | Air absorption + ISO 9613-1 validation | done |
 | M4 | Sources, receivers, IR export, room acoustics metrics | done |
-| M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | |
+| M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | done |
 | M6 | C/OpenMP backend + parity tests | |
 | M7 | Benchmark and dispersion studies, decision table | |
 | M8 | 4th-order and pressure-only variants, examples and animations | |
