@@ -46,6 +46,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from .boundaries import (
+    AbsorbingLayer,
+    WallAdmittances,
+    layer_factors,
+    wall_update_coefficients,
+)
 from .grid import Grid, max_stable_time_step
 from .medium import AIR, Medium
 
@@ -69,13 +75,52 @@ def _interior_faces(axis: int) -> tuple[slice, ...]:
     return tuple(slice(1, -1) if a == axis else slice(None) for a in _AXES)
 
 
+def _edge_slabs(factor: np.ndarray, axis: int) -> list[tuple[tuple[slice, ...], np.ndarray]]:
+    """Split a 1D damping profile into the slabs where it actually damps.
+
+    The profile is one everywhere except within the absorbing layer at each end, so multiplying
+    the whole field by it would be three full passes over memory to change a shell. Each
+    returned pair is an index into the field and the factor to multiply that slab by, already
+    shaped to broadcast.
+    """
+    damping = factor < 1.0
+    if not damping.any():
+        return []
+
+    def broadcast(values: np.ndarray) -> np.ndarray:
+        shape = [1, 1, 1]
+        shape[axis] = -1
+        return values.reshape(shape)
+
+    def index(span: slice) -> tuple[slice, ...]:
+        return tuple(span if a == axis else slice(None) for a in _AXES)
+
+    if damping.all():
+        return [(index(slice(None)), broadcast(factor))]
+
+    count = factor.size
+    leading = int(np.argmin(damping)) if damping[0] else 0
+    trailing = int(np.argmin(damping[::-1])) if damping[-1] else 0
+
+    slabs = []
+    if leading:
+        slabs.append((index(slice(0, leading)), broadcast(factor[:leading])))
+    if trailing:
+        slabs.append((index(slice(count - trailing, None)), broadcast(factor[count - trailing :])))
+    return slabs
+
+
 class AcousticFDTD:
-    """Lossless propagation in a rigid rectangular box.
+    """Propagation in a rectangular box, rigid by default.
 
     Rigid walls are enforced structurally rather than by a boundary routine: the velocity
     planes that lie on the walls are never written to, so they stay at the zero they were
     allocated with. That is both the fastest and the least fragile way to say ``v.n = 0``, and
     it is what makes the energy identity hold exactly.
+
+    Absorbing walls keep that arrangement — the wall velocity planes stay zero — and add the
+    flux through the wall to the pressure update of the boundary cells instead. See
+    :mod:`ac_fdtd.boundaries` for why that form, and not the obvious one, is the stable one.
 
     Args:
         grid: Geometry and spacing.
@@ -85,6 +130,9 @@ class AcousticFDTD:
             deliberate experiments, not for safety.
         dtype: Working precision. Double by default — this class is the reference the fast
             backends are checked against, so it should not be the one making approximations.
+        walls: Normalised admittance of each of the six walls. Default is rigid throughout.
+        absorbing_layer: Graded matched layer lining the whole domain, for free-field runs.
+            Combines with ``walls``, though there is rarely a reason to use both.
     """
 
     def __init__(
@@ -93,6 +141,8 @@ class AcousticFDTD:
         medium: Medium = AIR,
         courant: float = 1.0,
         dtype: np.dtype = np.float64,
+        walls: WallAdmittances | None = None,
+        absorbing_layer: AbsorbingLayer | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -100,6 +150,8 @@ class AcousticFDTD:
         self.grid = grid
         self.medium = medium
         self.courant = courant
+        self.walls = walls or WallAdmittances()
+        self.absorbing_layer = absorbing_layer
         self.dtype = np.dtype(dtype)
         self.dt = courant * max_stable_time_step(grid.dx, medium.sound_speed)
 
@@ -123,6 +175,35 @@ class AcousticFDTD:
         self._scratch = np.empty(grid.shape, dtype=self.dtype)
 
         self._sources: list[tuple[tuple[int, int, int], np.ndarray]] = []
+
+        # Absorbing walls: the two coefficients of the closed-form solve, on the boundary cells
+        # only. Empty arrays when every wall is rigid, and then the whole mechanism costs one
+        # `if` per step.
+        indices, coefficient = wall_update_coefficients(grid, medium, self.dt, self.walls)
+        self._wall_indices = indices
+        self._wall_from_updated = (1.0 / (1.0 + coefficient)).astype(self.dtype)
+        self._wall_from_previous = (coefficient / (1.0 + coefficient)).astype(self.dtype)
+
+        # Absorbing layer: 1D factors applied only to the slabs where they differ from one.
+        self._pressure_damping = []
+        self._velocity_damping = [[] for _ in _AXES]
+        if absorbing_layer is not None:
+            pressure_factors, velocity_factors = layer_factors(
+                grid, medium, self.dt, absorbing_layer
+            )
+            self._pressure_damping = [
+                slab
+                for axis in _AXES
+                for slab in _edge_slabs(pressure_factors[axis].astype(self.dtype), axis)
+            ]
+            for component in _AXES:
+                self._velocity_damping[component] = [
+                    slab
+                    for axis in _AXES
+                    for slab in _edge_slabs(
+                        velocity_factors[component][axis].astype(self.dtype), axis
+                    )
+                ]
 
     @property
     def vx(self) -> np.ndarray:
@@ -175,9 +256,18 @@ class AcousticFDTD:
     def step(self) -> None:
         """Advance one time step, preserving the ``(p^n, v^{n-1/2})`` pairing."""
         self._update_velocity()
+        self._damp(self.velocity[0], self._velocity_damping[0])
+        self._damp(self.velocity[1], self._velocity_damping[1])
+        self._damp(self.velocity[2], self._velocity_damping[2])
         self._update_pressure()
+        self._damp(self.p, self._pressure_damping)
         self._inject_sources()
         self.step_index += 1
+
+    @staticmethod
+    def _damp(field: np.ndarray, slabs) -> None:
+        for index, factor in slabs:
+            field[index] *= factor
 
     def run(self, n_steps: int) -> None:
         for _ in range(n_steps):
@@ -190,6 +280,9 @@ class AcousticFDTD:
             )
 
     def _update_pressure(self) -> None:
+        flat = self.p.reshape(-1)
+        previous_at_walls = flat[self._wall_indices].copy() if self._wall_indices.size else None
+
         divergence = self._divergence
         np.subtract(self.velocity[0][_upper(0)], self.velocity[0][_lower(0)], out=divergence)
         for axis in (1, 2):
@@ -198,6 +291,15 @@ class AcousticFDTD:
             divergence += self._scratch
         divergence *= self._pressure_coefficient
         self.p -= divergence
+
+        if previous_at_walls is not None:
+            # The closed-form solve of the time-centred wall condition. The wall faces of the
+            # velocity arrays stay at zero throughout, so the flux through the wall enters here
+            # and here only — counting it twice is the one way to get this wrong.
+            flat[self._wall_indices] = (
+                flat[self._wall_indices] * self._wall_from_updated
+                - previous_at_walls * self._wall_from_previous
+            )
 
     def _inject_sources(self) -> None:
         for index, signal in self._sources:

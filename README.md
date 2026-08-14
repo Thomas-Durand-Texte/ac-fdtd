@@ -9,8 +9,9 @@ an exact answer exists.
 
 ## Status
 
-**M1 — the lossless core is in and validated.** Rigid rectangular rooms only, NumPy only.
-Absorption, impedance boundaries and the fast backends are the milestones that follow.
+**M2 — the core and its boundaries are in and validated.** Rectangular rooms, absorbing walls,
+free field via an absorbing layer; NumPy only. Air absorption and the fast backends are the
+milestones that follow.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -24,20 +25,34 @@ Absorption, impedance boundaries and the fast backends are the milestones that f
 The one mode that misses is not excited: it has a node at the source or at the probe, so the
 nearest peak in the spectrum belongs to a different mode.
 
+![Validation of the boundaries](docs/figures/m2_boundaries.svg)
+
+| Check | Result |
+| --- | --- |
+| Wall reflection vs `(1-xi)/(1+xi)` | within 0.005 of theory; rigid case measures 0.9998 |
+| Impedance-matched wall | `\|R\| = 0.05` mean, rising to 0.09 at 17 points/wavelength |
+| Absorbing layer, normal incidence | −108 dB at 16 cells — exact by construction |
+| Absorbing layer in a 3D field | −17 to −31 dB, set by obliquity rather than thickness |
+| Free field vs analytical Green's function | 0.21 % at 61 points/wavelength |
+
+The layer result is the one to read carefully: doubling its thickness buys 3 dB, while moving
+the receiver 30 cells further from it buys 14. A matched layer is matched at normal incidence
+only. Beating −30 dB means a true PML, and −30 dB is the number it has to beat.
+
 ## Quickstart
 
 ```bash
 uv sync --extra dev
 uv run pytest
-uv run python scripts/validate_box.py     # regenerates the figure above
+uv run python scripts/validate_box.py         # regenerates the first figure
+uv run python scripts/validate_boundaries.py  # the second (about two minutes)
 ```
 
 ```python
-from ac_fdtd import AIR, AcousticFDTD, Grid
+from ac_fdtd import AIR, AcousticFDTD, Grid, WallAdmittances
 
-grid = Grid.from_max_frequency((5.0, 4.0, 3.0), max_frequency=1000.0,
-                               sound_speed=AIR.sound_speed)
-solver = AcousticFDTD(grid, medium=AIR)
+grid = Grid.from_max_frequency((5.0, 4.0, 3.0), max_frequency=1000.0, sound_speed=AIR.sound_speed)
+solver = AcousticFDTD(grid, medium=AIR, walls=WallAdmittances.from_absorption(0.15))
 solver.add_volume_source((1.0, 1.0, 1.2), signal)
 solver.run(1000)
 ```

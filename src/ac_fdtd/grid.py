@@ -29,6 +29,10 @@ __all__ = ["Grid", "max_stable_time_step"]
 #: and reads as a magic number otherwise.
 _N_DIMENSIONS = 3
 
+#: Fraction of a cell within which a coordinate is snapped up to the next cell boundary.
+#: See :meth:`Grid.cell_index` for the failure this exists to prevent.
+_INDEX_TOLERANCE = 1e-6
+
 
 def max_stable_time_step(dx: float, sound_speed: float) -> float:
     """Largest time step the explicit staggered scheme is stable at, in seconds.
@@ -129,9 +133,16 @@ class Grid:
 
         Clipping rather than raising is deliberate: a source nominally *on* a wall is a normal
         request, and ``x = Lx`` would otherwise fall one cell outside.
+
+        The tolerance is not cosmetic. ``1.2 / 0.01`` is ``119.99999999999999`` in binary
+        floating point, so a plain floor puts a point on a cell boundary in the cell below —
+        while ``0.5 / 0.01`` is exact and does not. The result was two grids of the same
+        spacing disagreeing by one cell about where the same point was, which showed up as a
+        7 % amplitude error in a free-field comparison and looked like a physics problem.
+        Snapping within a millionth of a cell removes the whole class of surprise.
         """
         return tuple(
-            int(min(max(math.floor(coordinate / self.dx), 0), count - 1))
+            int(min(max(math.floor(coordinate / self.dx + _INDEX_TOLERANCE), 0), count - 1))
             for coordinate, count in zip(point, self.shape, strict=True)
         )
 
