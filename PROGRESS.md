@@ -574,3 +574,122 @@ torn down and have workers start from zero — both halves, and either alone is 
 
 M7: the benchmark and dispersion studies proper — the sweep across grid size, bandwidth and
 precision, the roofline analysis, and the decision table those tables are the raw material for.
+
+---
+
+## M7 — How fine, and on what
+
+Two studies. The first decides the grid, the second decides the hardware, and they are in that
+order because the first one matters more.
+
+### Resolution, which is the expensive decision
+
+![Dispersion](docs/figures/m7_dispersion.svg)
+
+The dispersion relation is closed-form, so none of this needs a simulation:
+
+```
+sin(omega dt / 2) = (c dt / dx) sqrt( sum_axes sin^2(k_axis dx / 2) )
+```
+
+Phase velocity error by direction, at the stability limit:
+
+| points per wavelength | axis (1,0,0) | face diagonal | body diagonal | worst |
+| --- | --- | --- | --- | --- |
+| 5 | −4.556 % | −1.153 % | 0 | 4.556 % |
+| 8 | −1.740 % | −0.437 % | 0 | 1.740 % |
+| 10 | −1.107 % | −0.278 % | 0 | 1.107 % |
+| 20 | −0.275 % | −0.069 % | 0 | 0.275 % |
+| 60 | −0.031 % | −0.008 % | 0 | 0.031 % |
+
+**At Courant 1 the body diagonal is exact** — not small, zero, at every resolution, because the
+arcsine and its argument cancel identically. The axes are the worst case and everything else
+falls between, so the grid's error is anisotropic by about a factor of four.
+
+That is also the answer to why the default Courant number is 1. Running below the limit is not
+a safety margin; it breaks the cancellation and makes the error worse in *every* direction:
+
+| error target | Courant 1.0 | 0.9 | 0.5 | cells at 0.5 |
+| --- | --- | --- | --- | --- |
+| 5 % | 4.8 | 5.0 | 5.5 | 1.50x |
+| 1 % | **10.5** | 11.0 | 12.3 | 1.59x |
+| 0.5 % | 14.8 | 15.5 | 17.4 | 1.60x |
+| 0.1 % | 33.1 | 34.7 | 38.8 | 1.61x |
+
+So the conventional ten points per wavelength buys 1.1 % phase error, and 1 % costs 10.5 — the
+folk rule with a number attached at last. And a "safety" Courant of 0.5 costs 60 % more cells
+*and* twice as many steps for the same accuracy: a factor of three in run time to be more
+careful, spent on being less accurate.
+
+This is the highest-leverage number in the repository. Halving the required resolution divides
+the cell count by eight and the step count by two — sixteen times faster, which is more than
+the spread between the fastest and slowest backend measured below.
+
+### Backends
+
+![Backends](docs/figures/m7_backends.svg)
+
+Throughput in Gcell-updates/s, absorbing walls, steps per size chosen to time about 0.4 G
+cell-updates each so a small grid is not timed over three milliseconds:
+
+| cells | NumPy fp64 | Torch CPU fp32 | Torch MPS fp32 | C fp64 | C fp32 |
+| --- | --- | --- | --- | --- | --- |
+| 0.3 M | 0.22 | 0.17 | 0.89 | 0.80 | **1.04** |
+| 2.1 M | 0.19 | 0.80 | 2.45 | 1.77 | 2.40 |
+| 7.1 M | 0.19 | 0.94 | 2.87 | 2.22 | **3.43** |
+| 16.8 M | 0.21 | 1.23 | 2.81 | 2.17 | **3.89** |
+| 56.6 M | 0.20 | 1.77 | 2.83 | 2.24 | **4.11** |
+
+**Where the bandwidth goes.** Measured stream ceilings on this machine, best of five trials of
+a fused add over 32.8 M float32: **328 GB/s on the CPU, 709 GB/s on MPS**. Traffic counted from
+each implementation — 41 array passes per cell per step for the whole-array backends, 12
+elements for the fused C loop:
+
+| backend | bytes/cell/step | achieved | of its device's ceiling |
+| --- | --- | --- | --- |
+| NumPy fp64 | 328 | 66 GB/s | 20 % (single-threaded) |
+| Torch CPU fp32 | 164 | 290 GB/s | 88 % |
+| Torch MPS fp32 | 164 | 465 GB/s | 66 % |
+| C fp64 | 96 | 215 GB/s | 66 % |
+| C fp32 | 48 | 197 GB/s | 60 % |
+
+This is the result worth taking away, and it is not the flattering one: **the fused C loop wins
+by moving 3.4x less data, not by moving data better.** PyTorch on the CPU is running at nearly
+the streaming ceiling — it is about as efficient per byte as this machine gets — and still
+loses by a factor of two, because expressing a step as whole-array operations means moving
+three times the bytes. It also means the C kernel has headroom: at Torch's efficiency it would
+reach about 5.9 Gcell-updates/s.
+
+(The traffic model is a count of array passes and is good to perhaps 20 %. An earlier version
+of this table divided one approximation by another and reported a backend at "108 % of the
+hardware", which is why the figure now plots bandwidth rather than a percentage.)
+
+### The decision table
+
+5 x 4 x 3 m room, 10.5 points per wavelength, one second of impulse response:
+
+| bandwidth | cells | memory | NumPy fp64 | Torch CPU | Torch MPS | C fp64 | C fp32 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 500 Hz | 0.2 M | 6 MB | 9 s | 11 s | 2 s | 2 s | 2 s |
+| 1 kHz | 1.7 M | 48 MB | 166 s | 42 s | 14 s | 20 s | 14 s |
+| 2 kHz | 13.8 M | 0.4 GB | 42 min | 7 min | 3 min | 4 min | **2 min** |
+| 4 kHz | 110 M | 2.9 GB | 10.9 h | 1.3 h | 47 min | 58 min | **33 min** |
+| 8 kHz | 885 M | 23 GB | 175 h | 20 h | 12.6 h | 15.6 h | **8.7 h** |
+
+Memory is for seven fp32 fields — pressure, three velocities, three relaxation states — so the
+full audio band fits in this machine's 64 GB with room to spare, and the wall is time rather
+than memory. Above 57 M cells the throughput is held at its measured plateau; the last three
+sizes support that, but memory pressure at 23 GB could still spoil it.
+
+**What to use.** Below about a million cells everything finishes in seconds and the choice does
+not matter. From there up it is the compiled backend, in single precision, which is 1.2–1.4x
+the GPU and 18x the NumPy reference. The GPU is the answer only if the machine has a CUDA
+device with bandwidth MPS does not — and even then, the honest order of operations is: fix the
+resolution first, fuse the loop second, choose the device third.
+
+### Next
+
+M8: the two scheme variants the plan has been holding in reserve — fourth-order in space, which
+would trade flops for a coarser grid, and the pressure-only form, which halves the fields. Both
+are attacks on the same quantity the last two studies say is the binding constraint: bytes
+moved per useful second of output.

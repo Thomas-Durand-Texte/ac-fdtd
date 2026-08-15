@@ -9,11 +9,11 @@ an exact answer exists.
 
 ## Status
 
-**M6 — physics complete, three backends.** Rectangular rooms, absorbing walls, free field via
-an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
-usual room-acoustics parameters. NumPy for reference, PyTorch for CPU/MPS/CUDA, and a compiled
-C loop that is about 18x the reference and beats the GPU. The benchmark and dispersion studies
-are what remain.
+**M7 — physics complete, three backends, measured.** Rectangular rooms, absorbing walls, free
+field via an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file
+with the usual room-acoustics parameters. NumPy for reference, PyTorch for CPU/MPS/CUDA, and a
+compiled C loop that is about 18x the reference and beats the GPU. What remains is the two
+scheme variants: fourth-order in space, and the pressure-only form.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -137,6 +137,23 @@ grow with run length, so fp32 is free here and MPS's lack of float64 gives nothi
 ```bash
 uv sync --extra torch   # the GPU path is an optional extra; the C one needs only a compiler
 ```
+
+### What a room costs
+
+5 x 4 x 3 m, 10.5 points per wavelength, one second of impulse response:
+
+| bandwidth | cells | memory | NumPy fp64 | Torch MPS | C fp32 |
+| --- | --- | --- | --- | --- | --- |
+| 1 kHz | 1.7 M | 48 MB | 166 s | 14 s | 14 s |
+| 2 kHz | 13.8 M | 0.4 GB | 42 min | 3 min | **2 min** |
+| 4 kHz | 110 M | 2.9 GB | 10.9 h | 47 min | **33 min** |
+| 8 kHz | 885 M | 23 GB | 175 h | 12.6 h | **8.7 h** |
+
+Cost scales as the fourth power of the bandwidth — three of those powers from the grid, one
+from the time step — so the resolution is the expensive decision, not the hardware. Ten points
+per wavelength buys 1.1 % phase velocity error; 1 % costs 10.5. And at the stability limit the
+scheme is **exact** along the body diagonal, which is why the default Courant number is 1: a
+"safety margin" of 0.5 needs 60 % more cells for the same accuracy, and twice the steps.
 
 ## Two things worth knowing before reading the code
 

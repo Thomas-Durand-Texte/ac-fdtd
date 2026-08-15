@@ -112,7 +112,7 @@ points per wavelength is worth more than any backend choice.
 | M4 | Sources, receivers, IR export, room acoustics metrics | done |
 | M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | done |
 | M6 | C backend (pthreads) + parity tests | done |
-| M7 | Benchmark and dispersion studies, decision table | |
+| M7 | Benchmark and dispersion studies, decision table | done |
 | M8 | 4th-order and pressure-only variants, examples and animations | |
 
 ## Conventions
