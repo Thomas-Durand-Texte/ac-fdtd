@@ -9,11 +9,13 @@ an exact answer exists.
 
 ## Status
 
-**M7 — physics complete, three backends, measured.** Rectangular rooms, absorbing walls, free
-field via an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file
-with the usual room-acoustics parameters. NumPy for reference, PyTorch for CPU/MPS/CUDA, and a
-compiled C loop that is about 18x the reference and beats the GPU. What remains is the two
-scheme variants: fourth-order in space, and the pressure-only form.
+**M8 — complete as planned.** Rectangular rooms, absorbing walls, free field via an absorbing
+layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the usual
+room-acoustics parameters. Three backends — NumPy for reference, PyTorch for CPU/MPS/CUDA, and
+a compiled C loop about 18x the reference that beats the GPU — plus a pressure-only variant
+that is 5x faster again with rigid walls only.
+
+![A pulse crossing a room](docs/figures/wavefront.svg)
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -137,6 +139,12 @@ grow with run length, so fp32 is free here and MPS's lack of float64 gives nothi
 ```bash
 uv sync --extra torch   # the GPU path is an optional extra; the C one needs only a compiler
 ```
+
+The **pressure-only variant** (`CScalarFDTD`) is five times faster again — 22 Gcell-updates/s,
+87 % of the machine's streaming bandwidth — because eliminating velocity leaves two arrays
+instead of four. It reproduces the pressure–velocity scheme to round-off, and supports rigid
+walls only: the impedance wall, the absorbing layer and the relaxation states would each need
+re-deriving as three-level relations. That derivation is the highest-value work outstanding.
 
 ### What a room costs
 

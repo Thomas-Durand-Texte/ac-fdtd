@@ -16,6 +16,11 @@ Three questions:
    many cells, how much memory, and how long one second of impulse response takes on each
    backend.
 
+The pressure-only variant is included, and it is not a drop-in: it supports rigid walls only.
+It is here because it bounds what the remaining work is worth — if halving the fields is worth
+a factor of five, then re-deriving the impedance wall and the relaxation states as three-level
+relations is the most valuable thing left to do.
+
 Run: ``uv run python scripts/backend_benchmark.py``  (a few minutes)
 """
 
@@ -38,7 +43,7 @@ import plotstyle  # noqa: E402
 from ac_fdtd import AIR, AcousticFDTD, Grid, WallAdmittances  # noqa: E402
 from ac_fdtd.dispersion import required_points_per_wavelength  # noqa: E402
 
-FIGURE_PATH = Path(__file__).resolve().parents[1] / "docs" / "figures" / "m7_backends.svg"
+FIGURE_PATH = Path(__file__).resolve().parents[1] / "docs" / "figures" / "backends.svg"
 
 SIZES = (64, 96, 128, 192, 256, 320, 384)
 #: Steps are chosen per size to time about this much work, so a small grid is not timed over
@@ -55,6 +60,8 @@ ARRAY_PASSES = 41
 #: Bytes per cell per step for the fused C kernel: 28 in the velocity sweep (p read once, the
 #: three velocity components read and written) and 20 in the pressure sweep.
 FUSED_BYTES_PER_ELEMENT = 12
+#: The pressure-only variant touches three arrays per cell per step instead of twelve.
+SCALAR_BYTES_PER_ELEMENT = 3
 
 ROOM = (5.0, 4.0, 3.0)
 BANDWIDTHS = (500.0, 1000.0, 2000.0, 4000.0, 8000.0)
@@ -154,6 +161,15 @@ def build_cases():
                 }
             )
     if c_backend is not None:
+        cases.append(
+            {
+                "name": "C fp32 p-only",
+                "family": "Scalar",
+                "bytes": SCALAR_BYTES_PER_ELEMENT * 4,
+                "ceiling": "cpu",
+                "make": lambda grid: c_backend.CScalarFDTD(grid, dtype=np.float32),
+            }
+        )
         for label, dtype in (("C fp64", np.float64), ("C fp32", np.float32)):
             cases.append(
                 {
@@ -231,6 +247,7 @@ def main() -> None:
         "NumPy": {"color": plotstyle.SERIES[0]},
         "Torch": {"color": plotstyle.SERIES[1]},
         "C": {"color": plotstyle.SERIES[2]},
+        "Scalar": {"color": plotstyle.INK},
     }
     dashes = {
         "NumPy fp64": (1, 0),
@@ -238,6 +255,7 @@ def main() -> None:
         "Torch MPS fp32": (5, 2),
         "C fp64": (5, 2),
         "C fp32": (1, 0),
+        "C fp32 p-only": (1, 0),
     }
     markers = {
         "NumPy fp64": "o",
@@ -245,6 +263,7 @@ def main() -> None:
         "Torch MPS fp32": "s",
         "C fp64": "^",
         "C fp32": "o",
+        "C fp32 p-only": "D",
     }
 
     figure, axes = plt.subplots(1, 3, figsize=(14.5, 4.4))

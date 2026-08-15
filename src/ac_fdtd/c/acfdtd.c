@@ -189,37 +189,124 @@ static void damp_pressure(const acfdtd *s, int32_t i_start, int32_t i_end) {
     }
 }
 
+/* ------------------------------------------------------- the pressure-only variant ----- */
+
+/* The same physics with half the fields.
+ *
+ * Eliminating velocity from the staggered pair gives the second-order wave equation on
+ * pressure alone, stepped over three time levels:
+ *
+ *     p^{n+1} = 2 p^n - p^{n-1} + (c dt / dx)^2 * laplacian(p^n)
+ *
+ * It is not an approximation of the pressure-velocity scheme, it *is* that scheme with the
+ * intermediate variable removed -- same Courant limit, same dispersion relation, and starting
+ * from `p^{-1} = p^0` it reproduces a run with `v^{-1/2} = 0` to the last bit.
+ *
+ * The point of it is memory traffic. Two cell-sized arrays instead of four, and with the new
+ * level written over the oldest one there are three array touches per cell per step against
+ * the pressure-velocity form's twelve. On a problem where bandwidth is the whole cost, that is
+ * the largest single lever left.
+ *
+ * What it gives up is everything the first-order system made easy: the impedance wall, the
+ * absorbing layer and the relaxation states would all need re-deriving as three-level
+ * relations. This kernel exists to measure what that work would be worth, not to replace
+ * anything, so it implements rigid walls only. A rigid wall is a mirrored ghost cell, which is
+ * what clamping the neighbour offset to zero does below -- and it is exactly what falls out of
+ * eliminating a wall face held at zero velocity. */
+
+typedef struct {
+    int32_t nx, ny, nz;
+    int64_t n_steps;
+    REAL lambda_squared; /* (c dt / dx)^2 */
+    REAL *current;
+    REAL *previous;
+} acfdtd_scalar;
+
+size_t acfdtd_scalar_struct_size(void) { return sizeof(acfdtd_scalar); }
+
+static void scalar_sweep(const acfdtd_scalar *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny, nz = s->nz;
+    const int64_t stride_x = (int64_t)ny * nz;
+    const int64_t stride_y = nz;
+    const REAL scale = s->lambda_squared;
+
+    for (int32_t i = i_start; i < i_end; i++) {
+        const int64_t low_x = (i > 0) ? -stride_x : 0;
+        const int64_t high_x = (i < s->nx - 1) ? stride_x : 0;
+
+        for (int32_t j = 0; j < ny; j++) {
+            const int64_t low_y = (j > 0) ? -stride_y : 0;
+            const int64_t high_y = (j < ny - 1) ? stride_y : 0;
+
+            const int64_t base = (int64_t)i * stride_x + (int64_t)j * stride_y;
+            const REAL *cur = s->current + base;
+            REAL *out = s->previous + base; /* the oldest level, overwritten by the newest */
+
+            /* The transverse part of the stencil, which does not depend on k. */
+            const int64_t offsets[4] = {low_x, high_x, low_y, high_y};
+
+            /* The two z faces are peeled out so the inner loop carries no boundary test. */
+            for (int32_t k = 0; k < nz; k += (nz > 1 ? nz - 1 : 1)) {
+                const REAL neighbours = cur[k + offsets[0]] + cur[k + offsets[1]] +
+                                        cur[k + offsets[2]] + cur[k + offsets[3]] +
+                                        cur[k + ((k > 0) ? -1 : 0)] +
+                                        cur[k + ((k < nz - 1) ? 1 : 0)];
+                out[k] = 2 * cur[k] - out[k] + scale * (neighbours - 6 * cur[k]);
+            }
+
+            for (int32_t k = 1; k < nz - 1; k++) {
+                const REAL neighbours = cur[k + offsets[0]] + cur[k + offsets[1]] +
+                                        cur[k + offsets[2]] + cur[k + offsets[3]] + cur[k - 1] +
+                                        cur[k + 1];
+                out[k] = 2 * cur[k] - out[k] + scale * (neighbours - 6 * cur[k]);
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------- the thread pool --- */
 
-enum { SWEEP_VELOCITY, SWEEP_PRESSURE, SWEEP_DAMP };
+/* One pool, shared by every kernel. A sweep is a function plus the range of planes to run it
+ * over, so adding a kernel does not mean adding a thread pool or a case to a switch. */
+typedef void (*sweep_function)(const void *state, int32_t i_start, int32_t i_end);
 
 static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t work_ready = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t work_done = PTHREAD_COND_INITIALIZER;
 static pthread_t workers[MAX_THREADS];
 
-static int n_threads = 0;    /* total workers including the calling thread */
-static int outstanding = 0;  /* helper threads still working on this sweep */
+static int n_threads = 0;   /* workers including the calling thread */
+static int outstanding = 0; /* helper threads still working on this sweep */
 static uint64_t generation = 0;
 static int stopping = 0;
-static const acfdtd *shared_state = NULL;
-static int shared_sweep = 0;
+static const void *shared_state = NULL;
+static sweep_function shared_sweep = NULL;
+static int32_t shared_extent = 0;
 
-/* An equal share of the slowest axis each, so every thread owns one contiguous block of memory.
- *
- * Dynamic block-stealing was tried here and measured no better: the kernel saturates the memory
- * system somewhere around eight threads, so what limits a sweep is bandwidth rather than one
- * thread finishing late. The simpler split stays. */
-static void run_chunk(const acfdtd *s, int sweep, int index) {
-    const int32_t start = (int32_t)((int64_t)s->nx * index / n_threads);
-    const int32_t end = (int32_t)((int64_t)s->nx * (index + 1) / n_threads);
-    if (start >= end) return;
+static void velocity_sweep(const void *state, int32_t start, int32_t end) {
+    update_velocity((const acfdtd *)state, start, end);
+}
 
-    switch (sweep) {
-        case SWEEP_VELOCITY: update_velocity(s, start, end); break;
-        case SWEEP_PRESSURE: update_pressure(s, start, end); break;
-        default: damp_pressure(s, start, end); break;
-    }
+static void pressure_sweep(const void *state, int32_t start, int32_t end) {
+    update_pressure((const acfdtd *)state, start, end);
+}
+
+static void damping_sweep(const void *state, int32_t start, int32_t end) {
+    damp_pressure((const acfdtd *)state, start, end);
+}
+
+static void wave_sweep(const void *state, int32_t start, int32_t end) {
+    scalar_sweep((const acfdtd_scalar *)state, start, end);
+}
+
+/* An equal share of the slowest axis each, so every thread owns one contiguous block of
+ * memory. Dynamic block-stealing was tried here and measured no better: the kernel saturates
+ * the memory system somewhere around eight threads, so what limits a sweep is bandwidth rather
+ * than one thread finishing late. The simpler split stays. */
+static void run_chunk(const void *state, sweep_function sweep, int32_t extent, int index) {
+    const int32_t start = (int32_t)((int64_t)extent * index / n_threads);
+    const int32_t end = (int32_t)((int64_t)extent * (index + 1) / n_threads);
+    if (start < end) sweep(state, start, end);
 }
 
 static void *worker_main(void *argument) {
@@ -246,11 +333,12 @@ static void *worker_main(void *argument) {
             return NULL;
         }
         seen = generation;
-        const acfdtd *state = shared_state;
-        const int sweep = shared_sweep;
+        const void *state = shared_state;
+        const sweep_function sweep = shared_sweep;
+        const int32_t extent = shared_extent;
         pthread_mutex_unlock(&pool_lock);
 
-        run_chunk(state, sweep, index);
+        run_chunk(state, sweep, extent, index);
 
         pthread_mutex_lock(&pool_lock);
         if (--outstanding == 0) pthread_cond_signal(&work_done);
@@ -316,28 +404,29 @@ int acfdtd_thread_count(void) {
 
 /* The calling thread takes chunk 0 itself rather than waiting: one fewer context switch per
  * sweep, and it keeps the serial case free of any pool machinery at all. */
-static void dispatch(const acfdtd *s, int sweep) {
+static void dispatch(const void *state, sweep_function sweep, int32_t extent) {
     if (n_threads <= 1) {
-        run_chunk(s, sweep, 0);
+        run_chunk(state, sweep, extent, 0);
         return;
     }
 
     pthread_mutex_lock(&pool_lock);
-    shared_state = s;
+    shared_state = state;
     shared_sweep = sweep;
+    shared_extent = extent;
     outstanding = n_threads - 1;
     generation++;
     pthread_cond_broadcast(&work_ready);
     pthread_mutex_unlock(&pool_lock);
 
-    run_chunk(s, sweep, 0);
+    run_chunk(state, sweep, extent, 0);
 
     pthread_mutex_lock(&pool_lock);
     while (outstanding > 0) pthread_cond_wait(&work_done, &pool_lock);
     pthread_mutex_unlock(&pool_lock);
 }
 
-/* ------------------------------------------------------------------------ the loop ----- */
+/* ------------------------------------------------------------------------ the loops ---- */
 
 static void gather_walls(const acfdtd *s) {
     for (int64_t w = 0; w < s->n_wall; w++) s->wall_scratch[w] = s->p[s->wall_index[w]];
@@ -358,12 +447,12 @@ void acfdtd_run(acfdtd *s, int64_t step_offset) {
     for (int64_t step = 0; step < s->n_steps; step++) {
         const int64_t absolute = step_offset + step;
 
-        dispatch(s, SWEEP_VELOCITY);
+        dispatch(s, velocity_sweep, s->nx);
 
         if (s->n_wall) gather_walls(s);
-        dispatch(s, SWEEP_PRESSURE);
+        dispatch(s, pressure_sweep, s->nx);
         if (s->n_wall) finish_walls(s);
-        if (s->has_layer) dispatch(s, SWEEP_DAMP);
+        if (s->has_layer) dispatch(s, damping_sweep, s->nx);
 
         for (int64_t source = 0; source < s->n_sources; source++)
             if (absolute < s->source_length)
@@ -372,5 +461,18 @@ void acfdtd_run(acfdtd *s, int64_t step_offset) {
 
         for (int64_t receiver = 0; receiver < s->n_receivers; receiver++)
             s->recording[receiver * s->n_steps + step] = s->p[s->receiver_index[receiver]];
+    }
+}
+
+/* Leaves the newest level in `current`, having swapped the two pointers once per step. The
+ * caller tracks which of its two arrays that is by counting steps. */
+void acfdtd_scalar_run(acfdtd_scalar *s) {
+    if (n_threads == 0) acfdtd_set_threads(0);
+
+    for (int64_t step = 0; step < s->n_steps; step++) {
+        dispatch(s, wave_sweep, s->nx);
+        REAL *swap = s->current;
+        s->current = s->previous;
+        s->previous = swap;
     }
 }

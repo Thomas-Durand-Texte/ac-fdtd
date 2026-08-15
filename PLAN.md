@@ -50,10 +50,11 @@ Courant condition `c dt sqrt(3) / dx <= 1`, and the limit is also where numerica
 smallest — so the default is to run *at* it, not below.
 
 **Why keep the p–v pair rather than a pressure-only scheme.** The second-order wave equation on
-pressure alone carries two fields instead of four, which on a bandwidth-bound problem is close
-to a factor two in wall time. That is a real advantage and it will be measured (M8). What the
-first-order system buys is everything else in this plan: impedance boundaries, PML, and the
-relaxation states of the air model all attach naturally to it.
+pressure alone carries two fields instead of four. Measured in M8, that is a factor of *five*,
+not two — more than any other lever in the project. What the first-order system buys is
+everything else in this plan: impedance boundaries, the absorbing layer, and the relaxation
+states of the air model all attach naturally to it, and each would need re-deriving as a
+three-level relation to move across. That derivation is now the highest-value work outstanding.
 
 **Air absorption.** Implemented as two auxiliary relaxation states (O2, N2) plus a classical
 term. Not *fitted* to the ISO 9613-1 curve — a relaxing fluid has exactly the ISO functional
@@ -113,7 +114,7 @@ points per wavelength is worth more than any backend choice.
 | M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | done |
 | M6 | C backend (pthreads) + parity tests | done |
 | M7 | Benchmark and dispersion studies, decision table | done |
-| M8 | 4th-order and pressure-only variants, examples and animations | |
+| M8 | Pressure-only variant (done), 4th order (analysed), examples | done |
 
 ## Conventions
 

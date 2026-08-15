@@ -33,7 +33,7 @@ from .boundaries import AbsorbingLayer, WallAdmittances, layer_factors, wall_upd
 from .grid import Grid, max_stable_time_step
 from .medium import AIR, Medium
 
-__all__ = ["CAcousticFDTD", "build", "build_report", "is_available"]
+__all__ = ["CAcousticFDTD", "CScalarFDTD", "build", "build_report", "is_available"]
 
 _SOURCE = Path(__file__).resolve().parent / "c" / "acfdtd.c"
 _MAX_RELAXATION = 4
@@ -84,6 +84,8 @@ def _library(dtype: np.dtype) -> ctypes.CDLL:
     if key not in _libraries:
         library = ctypes.CDLL(str(build(dtype)))
         library.acfdtd_struct_size.restype = ctypes.c_size_t
+        library.acfdtd_scalar_struct_size.restype = ctypes.c_size_t
+        library.acfdtd_scalar_run.restype = None
         library.acfdtd_thread_count.restype = ctypes.c_int
         library.acfdtd_set_threads.restype = ctypes.c_int
         library.acfdtd_set_threads.argtypes = [ctypes.c_int]
@@ -155,6 +157,23 @@ def _structure(dtype: np.dtype) -> type[ctypes.Structure]:
         ]
 
     return State
+
+
+def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
+    real = ctypes.c_double if dtype == np.float64 else ctypes.c_float
+
+    class ScalarState(ctypes.Structure):
+        _fields_ = [
+            ("nx", ctypes.c_int32),
+            ("ny", ctypes.c_int32),
+            ("nz", ctypes.c_int32),
+            ("n_steps", ctypes.c_int64),
+            ("lambda_squared", real),
+            ("current", ctypes.POINTER(real)),
+            ("previous", ctypes.POINTER(real)),
+        ]
+
+    return ScalarState
 
 
 class CAcousticFDTD:
@@ -380,3 +399,83 @@ class CAcousticFDTD:
             coupling += float(np.sum(component[interior] * gradient))
 
         return cell_volume * (potential + kinetic - 0.5 * self.dt * coupling)
+
+
+class CScalarFDTD:
+    """The pressure-only variant: the same scheme with velocity eliminated.
+
+    Two cell-sized arrays instead of four, and three array touches per cell per step instead of
+    twelve. It is not an approximation — starting from ``p^{-1} = p^0`` it reproduces a
+    pressure-velocity run started from ``v^{-1/2} = 0`` to the last bit, which is what
+    ``tests/test_scalar_variant.py`` checks.
+
+    **Rigid walls only.** The impedance wall, the absorbing layer and the relaxation states are
+    all natural in a first-order system and would each need re-deriving as a three-level
+    relation here. This exists to measure what that work would be worth before doing it.
+    """
+
+    def __init__(
+        self,
+        grid: Grid,
+        medium: Medium = AIR,
+        courant: float = 1.0,
+        dtype: np.dtype = np.float64,
+    ) -> None:
+        if not 0.0 < courant <= 1.0:
+            raise ValueError(f"courant must be in (0, 1], got {courant}")
+
+        self.grid = grid
+        self.medium = medium
+        self.courant = courant
+        self.dtype = np.dtype(dtype)
+        self.dt = courant * max_stable_time_step(grid.dx, medium.sound_speed)
+        self.step_index = 0
+
+        self._library = _library(self.dtype)
+        self._state_type = _scalar_structure(self.dtype)
+        if ctypes.sizeof(self._state_type) != self._library.acfdtd_scalar_struct_size():
+            raise RuntimeError("the ctypes mirror of acfdtd_scalar no longer matches the C one")
+
+        self._buffers = [
+            np.zeros(grid.shape, dtype=self.dtype),
+            np.zeros(grid.shape, dtype=self.dtype),
+        ]
+        #: Which buffer holds the newest level. The C loop swaps its own pointers once per
+        #: step, so after an odd number of steps the roles have changed places.
+        self._newest = 0
+
+    @property
+    def p(self) -> np.ndarray:
+        """The newest pressure level."""
+        return self._buffers[self._newest]
+
+    @property
+    def previous(self) -> np.ndarray:
+        """The level before it. Equal to :attr:`p` at rest, which is the state ``v = 0``."""
+        return self._buffers[1 - self._newest]
+
+    def set_initial_pressure(self, field: np.ndarray) -> None:
+        """Start from a given pressure at rest — both levels equal, so the velocity is zero."""
+        for buffer in self._buffers:
+            buffer[:] = field
+
+    @property
+    def threads(self) -> int:
+        return int(self._library.acfdtd_thread_count())
+
+    def run(self, n_steps: int) -> None:
+        if n_steps <= 0:
+            return
+        real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
+        state = self._state_type(
+            nx=self.grid.nx,
+            ny=self.grid.ny,
+            nz=self.grid.nz,
+            n_steps=n_steps,
+            lambda_squared=(self.medium.sound_speed * self.dt / self.grid.dx) ** 2,
+            current=self.p.ctypes.data_as(ctypes.POINTER(real)),
+            previous=self.previous.ctypes.data_as(ctypes.POINTER(real)),
+        )
+        self._library.acfdtd_scalar_run(ctypes.byref(state))
+        self.step_index += n_steps
+        self._newest ^= n_steps & 1

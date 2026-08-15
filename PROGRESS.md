@@ -627,7 +627,7 @@ the spread between the fastest and slowest backend measured below.
 
 ### Backends
 
-![Backends](docs/figures/m7_backends.svg)
+![Backends](docs/figures/backends.svg)
 
 Throughput in Gcell-updates/s, absorbing walls, steps per size chosen to time about 0.4 G
 cell-updates each so a small grid is not timed over three milliseconds:
@@ -693,3 +693,103 @@ M8: the two scheme variants the plan has been holding in reserve — fourth-orde
 would trade flops for a coarser grid, and the pressure-only form, which halves the fields. Both
 are attacks on the same quantity the last two studies say is the binding constraint: bytes
 moved per useful second of output.
+
+---
+
+## M8 — The two variants
+
+Both variants attack the same quantity: bytes moved per second of output. One is implemented
+and measured; the other is analysed, and the analysis is the reason it is not implemented yet.
+
+### The pressure-only form — implemented, and it is the biggest lever left
+
+Eliminating velocity from the staggered pair gives the second-order wave equation on pressure
+alone, over three time levels:
+
+```
+p^{n+1} = 2 p^n - p^{n-1} + (c dt / dx)^2 laplacian(p^n)
+```
+
+This is not an approximation of the pressure–velocity scheme, it *is* that scheme with the
+intermediate variable removed — same Courant limit, same dispersion relation. Started from
+`p^{-1} = p^0`, which is what `v^{-1/2} = 0` becomes, it reproduces a pressure–velocity run to
+round-off: **3.7e-16 after one step and 4.5e-14 after two hundred**, the drift being nothing but
+a different order of operations.
+
+Two arrays instead of four, and with the new level written over the oldest there are three
+array touches per cell per step against twelve:
+
+| grid | p–v fp32 | pressure-only fp32 | ratio |
+| --- | --- | --- | --- |
+| 0.3 M | 0.91 | 2.53 | 2.8x |
+| 2.1 M | 2.03 | 10.30 | 5.1x |
+| 16.8 M | 4.09 | 22.10 | 5.4x |
+| 56.6 M | 4.17 | 19.95 | 4.8x |
+
+Gcell-updates/s. **About five times faster** — more than the C-versus-PyTorch fusion, more than
+the GPU. And it reaches 216–286 GB/s against the 323 GB/s stream ceiling, so where the p–v
+kernel sits at 60 % of the hardware this one is at 70–87 %: fewer arrays in flight is also a
+simpler access pattern.
+
+In the decision table that is **8 kHz in a 5 x 4 x 3 m room in 2.3 hours instead of 8.5**, and
+one second of response at 2 kHz in 24 seconds instead of 133.
+
+**What it costs is every boundary condition.** The impedance wall, the absorbing layer and the
+relaxation states are all natural in a first-order system and would each need re-deriving as a
+three-level relation. This kernel therefore supports rigid walls only, and exists to bound what
+that derivation is worth before doing it. At a factor of five, it is worth doing.
+
+### Fourth order in space — analysed, not implemented
+
+The dispersion module now carries the fourth-order staggered symbol, so the trade-off is a
+calculation rather than a guess. The name promises more than it delivers:
+
+| points per wavelength | second order | fourth order |
+| --- | --- | --- |
+| 5 | 4.556 % | 1.553 % |
+| 10 | 1.107 % | 0.399 % |
+| 20 | 0.275 % | 0.101 % |
+
+**A fourth-order spatial operator with a leapfrog time step is still second order overall** —
+the error still falls as the square of the resolution, and what improves is the constant, by
+about 2.8x. What is left is the time discretisation, and the exact cancellation along the body
+diagonal is gone as well, because the wider stencil forces a smaller Courant number (0.495
+against 0.577).
+
+It is still a real gain: 6.3 points per wavelength instead of 10.5 for one percent, which is
+4.7x fewer cells and, after paying for the shorter time step, **6.8x fewer cell-updates**.
+
+**Why it is not implemented.** The wider stencil reaches outside the domain near a wall, and the
+usual fix — dropping to a narrower stencil in the boundary cells — breaks the property this
+repository rests on: the discrete divergence and gradient are exact negative adjoints, which is
+what makes the energy identity hold to round-off rather than approximately. Keeping it means
+constructing the gradient with whatever stencils the boundary allows and then *defining* the
+divergence as its transpose, which changes the pressure update in the three cells nearest each
+wall on each axis. That is a summation-by-parts redesign of the interior operator, not an
+increment, and doing it carelessly would trade a measurable factor of six for an unmeasurable
+loss of the repository's sharpest test.
+
+So it is written down with its payoff quantified and its design settled, and left as the next
+piece of work. Ordered by value, what remains is: the three-level boundary conditions (5x,
+already measured), then fourth order (a further 6.8x, design known), then hardware.
+
+### An example, because a table is not a picture
+
+![Wavefront](docs/figures/wavefront.svg)
+
+A pulse crossing a 4 x 3 x 2.5 m room: the expanding wavefront, the first reflections arriving
+from each wall, and by 28 ms an interference pattern that is the beginning of a reverberant
+field. Everything in it is validated quantitatively elsewhere; it is here because a field of
+numbers is hard to have intuitions about.
+
+### Where the project stands
+
+Every rung of the validation ladder that has an exact answer is met to round-off or better:
+energy to 4e-16, a single mode to 1e-13, the free-field Green's function to 0.2 %, ISO 9613-1
+to 1.2 %. The two rungs without exact answers behave as they should — T60 between Eyring and
+Sabine above the Schroeder frequency, and away from both below it.
+
+The performance question the repository set out to ask has an answer that is not the expected
+one: the fastest thing on this machine is single-precision compiled C on the CPU, and the
+ranking is set by how many bytes a formulation moves rather than by how fast the hardware can
+move them.
