@@ -9,10 +9,11 @@ an exact answer exists.
 
 ## Status
 
-**M5 — physics complete, PyTorch backend in.** Rectangular rooms, absorbing walls, free field
-via an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
-usual room-acoustics parameters, and a GPU path that is 14x the NumPy reference. The C backend
-and the full benchmark are what remain.
+**M6 — physics complete, three backends.** Rectangular rooms, absorbing walls, free field via
+an absorbing layer, ISO 9613-1 air absorption, impulse responses out to a wav file with the
+usual room-acoustics parameters. NumPy for reference, PyTorch for CPU/MPS/CUDA, and a compiled
+C loop that is about 18x the reference and beats the GPU. The benchmark and dispersion studies
+are what remain.
 
 ![Validation of the lossless scheme in a rigid box](docs/figures/m1_box_validation.svg)
 
@@ -111,24 +112,30 @@ solver.run(1000)
 
 ### Backends
 
-| grid | NumPy fp64 | Torch CPU fp32 | MPS fp32 |
-| --- | --- | --- | --- |
-| 64³ | 0.19 | 0.17 | 0.67 |
-| 256³ | 0.20 | 1.22 | 2.78 |
-| 320³ | 0.20 | 1.79 | 2.80 |
+| grid | NumPy fp64 | Torch CPU fp32 | MPS fp32 | C fp64 | C fp32 |
+| --- | --- | --- | --- | --- | --- |
+| 64³ | 0.21 | 0.18 | 0.78 | 0.84 | **1.06** |
+| 256³ | 0.21 | 1.14 | 2.84 | 2.00 | **4.07** |
+| 384³ | 0.21 | 1.94 | 2.84 | 2.22 | **3.71** |
 
-Billions of cell-updates per second, on an M2 Ultra. In double precision on the CPU, the
-PyTorch backend agrees with the NumPy reference **bitwise**, for every combination of walls,
-absorbing layer and air absorption.
+Billions of cell-updates per second, on an M2 Ultra (16 performance cores, 64 GB unified).
+All three backends agree: the PyTorch one matches the NumPy reference **bitwise** in double
+precision, the C one to 4e-15, for every combination of walls, absorbing layer and air
+absorption.
 
-Two results worth knowing before choosing a backend. At 64³ PyTorch on the CPU is *slower* than
-NumPy — small arrays make dispatching an operation cost more than performing it, and that
-regime ends by 128³. And single precision costs a noise floor at −112 dB relative to the peak
-that does not grow with run length, so for this scheme fp32 is free; MPS, which has no float64
-at all, is not giving anything up.
+**The compiled CPU loop beats the GPU at every size**, by 20–40 %, despite MPS having 2.4x the
+CPU's streaming bandwidth (727 vs 306 GB/s, measured). A scheme written as whole-array
+operations spends about forty passes over memory per step; fusing it into two sweeps costs
+48 bytes per cell instead. The framework's convenience costs more than the GPU's bandwidth is
+worth — so fuse the loop first, then choose a device.
+
+Two smaller results worth knowing. At 64³ PyTorch on the CPU is *slower* than NumPy, because
+dispatching an operation costs more than performing it on arrays that small; that regime ends
+by 128³. And single precision costs a noise floor at −112 dB relative to the peak that does not
+grow with run length, so fp32 is free here and MPS's lack of float64 gives nothing up.
 
 ```bash
-uv sync --extra torch   # the GPU path is an optional extra
+uv sync --extra torch   # the GPU path is an optional extra; the C one needs only a compiler
 ```
 
 ## Two things worth knowing before reading the code

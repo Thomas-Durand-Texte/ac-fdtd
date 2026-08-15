@@ -26,7 +26,8 @@ to be re-measured here.
   handled rather than left to the caller. Deliberately no swept sines: they exist to buy
   signal-to-noise ratio and to reject distortion, and a simulation has neither problem.
 - Room acoustics metrics: Schroeder decay, T60, EDT, C50; wav/npz export.
-- Backends: NumPy reference (fp64), PyTorch (CPU / MPS / CUDA), C with OpenMP.
+- Backends: NumPy reference (fp64), PyTorch (CPU / MPS / CUDA), and a compiled C loop
+  threaded with pthreads (OpenMP conflicts with the one PyTorch ships; see `PROGRESS.md`).
 
 **Out of scope**
 - Non-rectangular geometry beyond staircased boundaries; no cut-cell or unstructured meshing.
@@ -82,7 +83,7 @@ matters for T60 in large volumes, and a bound on accumulated high-frequency nume
 
 ## Performance study (M7)
 
-Sweep: backend {NumPy, Torch-CPU, Torch-MPS, C+OpenMP} x grid {64³ … 512³, 768³ as a stress
+Sweep: backend {NumPy, Torch-CPU, Torch-MPS, C} x grid {64³ … 512³, 768³ as a stress
 point} x max frequency {500 Hz, 1 kHz, 2 kHz, 4 kHz} x dtype {fp32, fp64}.
 
 Reported as **cell-updates per second and achieved bandwidth against the machine's roofline**,
@@ -110,7 +111,7 @@ points per wavelength is worth more than any backend choice.
 | M3 | Air absorption + ISO 9613-1 validation | done |
 | M4 | Sources, receivers, IR export, room acoustics metrics | done |
 | M5 | PyTorch backend (CPU/MPS/CUDA) + parity tests | done |
-| M6 | C/OpenMP backend + parity tests | |
+| M6 | C backend (pthreads) + parity tests | done |
 | M7 | Benchmark and dispersion studies, decision table | |
 | M8 | 4th-order and pressure-only variants, examples and animations | |
 

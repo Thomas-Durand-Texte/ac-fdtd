@@ -469,3 +469,108 @@ M6: the C backend. MPS saturates at 2.8 GCUPS, which is about 60 % of what its m
 bandwidth ceiling allows — the gap is probably the strided slice access the scheme is written
 in. A compiled loop that fuses the whole step into one pass over memory is the natural
 comparison, and it is also the one that will say whether the remaining 40 % is reachable.
+
+---
+
+## M6 — The C backend
+
+The whole time loop compiled, fused into two sweeps per step, driven from Python by ctypes and
+built on first use.
+
+### Design decisions
+
+**Two sweeps, not forty passes.** NumPy and PyTorch both express a step as a sequence of
+whole-array operations — about forty passes over memory per step, each one larger than any
+cache. Fusing the step into one velocity sweep and one pressure sweep cuts the traffic to about
+48 bytes per cell per step in single precision. It is two sweeps and not one because the
+pressure update needs the *updated* velocity across its whole stencil; fusing further needs
+temporal blocking, which is a different piece of work.
+
+**pthreads, not OpenMP — and this was forced rather than chosen.** OpenMP was the obvious first
+attempt and it works, on Apple's clang via `-Xpreprocessor -fopenmp` against Homebrew's libomp.
+It does not survive contact with PyTorch: torch ships its own copy of libomp, a second runtime
+in the same process aborts the interpreter with *"found libomp.dylib already initialized"*, and
+the documented workaround is a flag that admits it "may silently produce incorrect results".
+Since both backends are loaded together in the test suite and in any honest benchmark, that was
+not a tradeoff worth making. A persistent pthread pool is sixty lines, cannot conflict with
+anyone, and removes the build's only external prerequisite — the library now needs nothing but
+a C compiler.
+
+**The default thread count is the number of performance cores, not of processors.** On this
+machine that is 16 rather than 24, and the difference is not academic:
+
+| threads | GCUPS | GB/s | speedup |
+| --- | --- | --- | --- |
+| 1 | 1.06 | 51 | 1.0x |
+| 2 | 1.90 | 91 | 1.8x |
+| 4 | 3.10 | 149 | 2.9x |
+| 8 | 3.29 | 158 | 3.1x |
+| **16** | **4.15** | **199** | **3.9x** |
+| 24 | 3.68 | 176 | 3.5x |
+
+A sweep ends when its slowest share does, so adding eight efficiency cores to sixteen
+performance ones makes it 11 % *slower*. Dynamic block-stealing was implemented to fix that and
+measured no better — the kernel saturates the memory system somewhere around eight threads, so
+what limits a sweep is bandwidth, not one thread finishing late. The simpler static split
+stayed, and the default now asks the OS which cores are the fast ones.
+
+Note also the single-thread figure: **one core of compiled C is five times the whole NumPy
+reference**, which is what forty passes over memory costs.
+
+**`-ffp-contract=off`.** At `-O3` clang fuses `a*b+c` into a single FMA, which is *more*
+accurate than the reference but not *equal* to it. A backend that differs by a few ulp is more
+dangerous than one that differs by a lot, because it reads as a physics result.
+
+### Results
+
+**Parity.** Against the NumPy reference in double precision: exactly zero difference for the
+rigid box and for absorbing walls; 2e-15 to 4e-15 relative with the absorbing layer or air
+absorption, where the fused loop sums the same terms in a different order. Velocity fields,
+receiver recordings and energy all agree to the same tolerance.
+
+**Throughput**, billions of cell-updates per second:
+
+| grid | cells | NumPy fp64 | Torch CPU fp32 | MPS fp32 | C fp64 | C fp32 | C vs MPS |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64³ | 0.3 M | 0.21 | 0.18 | 0.78 | 0.84 | 1.06 | 1.35x |
+| 128³ | 2.1 M | 0.19 | 0.86 | 1.97 | 1.82 | 2.35 | 1.19x |
+| 192³ | 7.1 M | 0.20 | 1.00 | 2.89 | 2.31 | 3.47 | 1.20x |
+| 256³ | 16.8 M | 0.21 | 1.14 | 2.84 | 2.00 | 4.07 | 1.43x |
+| 320³ | 32.8 M | 0.21 | 1.37 | 2.82 | 2.12 | 3.77 | 1.33x |
+| 384³ | 56.6 M | 0.21 | 1.94 | 2.84 | 2.22 | 3.71 | 1.30x |
+
+**The compiled CPU backend beats the GPU at every size tested**, by 20–40 %, and beats the
+NumPy reference by about 18x. It also wins where the GPU is weakest — small grids, where
+kernel launches dominate — and it does so in *double* precision as well: C fp64 moves twice
+the bytes of Torch fp32 and is still faster than it.
+
+That is the answer to the question this repository set out to ask, and it is not the answer
+the hardware's raw numbers suggest. MPS has 2.4x the CPU's streaming bandwidth (727 GB/s
+against 306 GB/s, measured) and loses anyway, because a scheme written as whole-array
+operations spends most of its traffic re-reading arrays that a fused loop keeps in registers.
+The framework's convenience costs more than the GPU's bandwidth is worth. Given that a CUDA
+device has far more bandwidth headroom than MPS does, the conclusion to carry elsewhere is
+narrower: **fuse the loop first, then ask which device to run it on.**
+
+### Two bugs in sixty lines of thread pool
+
+Both were mine, both were found by running the thing rather than by reading it, and both are
+now regression tests.
+
+**A stale generation counter, surfacing as a bus error.** Rebuilding the pool — which is what
+changing the thread count does — left the generation counter where it was, so every new worker
+started with a counter that already looked like pending work and immediately ran a chunk
+against the *previous* run's state pointer. That pointer belonged to a freed array by then. The
+crash was in the benchmark, a long way from the cause.
+
+**Fixing it the obvious way introduced a deadlock.** Having each worker read the *current*
+generation at startup fixes the first bug and creates a worse one: a worker that finishes
+starting up after a sweep has been dispatched decides it has already done that sweep, never
+decrements the outstanding counter, and leaves the dispatching thread waiting forever. The test
+suite stopped producing output at all. The correct fix is to reset the counter when the pool is
+torn down and have workers start from zero — both halves, and either alone is a bug.
+
+### Next
+
+M7: the benchmark and dispersion studies proper — the sweep across grid size, bandwidth and
+precision, the roofline analysis, and the decision table those tables are the raw material for.
