@@ -18,7 +18,7 @@ Two traps are worth naming, because both were live in this repository before thi
 * **Decay rates are measured on the raw recording, not the deconvolved response.** Deconvolution
   divides two spectra and leaves a small broadband residue where the excitation had little
   energy; that residue never decays, so backward integration reaches it and flattens out, and
-  the T30 fit then reports the noise floor as a reverberation time. The excitation is a few
+  the TR30 fit then reports the noise floor as a reverberation time. The excitation is a few
   milliseconds long, so it affects the first few milliseconds of the decay and nothing else.
 
 Run: ``uv run python scripts/validate_reverberation.py``  (a few minutes)
@@ -90,13 +90,18 @@ def main() -> None:
 
     recordings, sample_rate, response = run()
 
-    per_band = {}
-    for centre in OCTAVE_CENTRES:
-        times = []
-        for recording in recordings:
-            filtered = octave_band(recording, sample_rate, centre)
-            times.append(reverberation_time(filtered, sample_rate, 20.0))
-        per_band[centre] = np.array(times)
+    # Both evaluation ranges: TR20 fits the decay from -5 to -25 dB, TR30 from -5 to -35.
+    # TR30 is the more robust of the two and the one quoted, because it uses more of the decay;
+    # TR20 is kept because a disagreement between them is the standard sign that a decay is not
+    # a single straight line.
+    per_band = {20.0: {}, 30.0: {}}
+    for evaluation_range in per_band:
+        for centre in OCTAVE_CENTRES:
+            times = []
+            for recording in recordings:
+                filtered = octave_band(recording, sample_rate, centre)
+                times.append(reverberation_time(filtered, sample_rate, evaluation_range))
+            per_band[evaluation_range][centre] = np.array(times)
 
     predicted_sabine = np.array([ROOM.sabine_reverberation_time(f) for f in OCTAVE_CENTRES])
     predicted_eyring = np.array([ROOM.eyring_reverberation_time(f) for f in OCTAVE_CENTRES])
@@ -129,8 +134,10 @@ def main() -> None:
             color=colour,
             label=f"{centre:.0f} Hz",
         )
-    ax.axhspan(-25.0, -5.0, color=plotstyle.GRID, alpha=0.6, zorder=0)
-    ax.text(5, -15, "T20 fit range", fontsize=8, color=plotstyle.MUTED)
+    ax.axhspan(-35.0, -5.0, color=plotstyle.GRID, alpha=0.35, zorder=0)
+    ax.axhspan(-25.0, -5.0, color=plotstyle.GRID, alpha=0.55, zorder=0)
+    ax.text(5, -14, "TR20 fit range", fontsize=8, color=plotstyle.MUTED)
+    ax.text(5, -31, "TR30 fit range", fontsize=8, color=plotstyle.MUTED)
     # Stops short of the end of the recording: backward integration always falls off a cliff
     # in its last samples, and that cliff is the integration's own edge, not the room's.
     ax.set_xlim(0, 1e3 * 0.6 * DURATION)
@@ -142,8 +149,8 @@ def main() -> None:
 
     # --- against the formulae ----------------------------------------------------------
     ax = axes[2]
-    means = np.array([per_band[c].mean() for c in OCTAVE_CENTRES])
-    spread = np.array([per_band[c].std() for c in OCTAVE_CENTRES])
+    means = np.array([per_band[30.0][c].mean() for c in OCTAVE_CENTRES])
+    spread = np.array([per_band[30.0][c].std() for c in OCTAVE_CENTRES])
     ax.errorbar(
         OCTAVE_CENTRES,
         means,
@@ -151,7 +158,15 @@ def main() -> None:
         fmt="o-",
         color=plotstyle.SERIES[0],
         capsize=4,
-        label=f"simulated, {len(recordings)} positions",
+        label=f"simulated TR30, {len(recordings)} positions",
+    )
+    ax.plot(
+        OCTAVE_CENTRES,
+        [per_band[20.0][c].mean() for c in OCTAVE_CENTRES],
+        "o:",
+        color=plotstyle.SERIES[0],
+        markerfacecolor="white",
+        label="simulated TR20",
     )
     ax.plot(OCTAVE_CENTRES, predicted_sabine, "s--", color=plotstyle.SERIES[1], label="Sabine")
     ax.plot(OCTAVE_CENTRES, predicted_eyring, "^--", color=plotstyle.SERIES[2], label="Eyring")
@@ -168,7 +183,7 @@ def main() -> None:
     ax.set_xticklabels([f"{c:.0f}" for c in OCTAVE_CENTRES])
     ax.set_ylim(0, 0.45)
     ax.set_xlabel("octave band centre  [Hz]")
-    ax.set_ylabel("T20 extrapolated to 60 dB  [s]")
+    ax.set_ylabel("reverberation time  [s]")
     ax.set_title(f"Schroeder frequency {crossover:.0f} Hz")
     ax.legend(loc="upper right")
 
@@ -185,14 +200,15 @@ def main() -> None:
         f"{response.sample_rate / 1e3:.1f} kHz, {len(recordings)} source-receiver pairs"
     )
     print(f"Schroeder frequency {crossover:.0f} Hz\n")
-    print("  band     simulated T20        Sabine   Eyring   vs Eyring")
+    print("  band     simulated TR30       simulated TR20      Sabine   Eyring  TR30 vs Eyring")
     for centre, sabine, eyring in zip(
         OCTAVE_CENTRES, predicted_sabine, predicted_eyring, strict=True
     ):
-        values = per_band[centre]
+        thirty, twenty = per_band[30.0][centre], per_band[20.0][centre]
         print(
-            f"  {centre:5.0f} Hz  {values.mean():.3f} +/- {values.std():.3f} s   "
-            f"{sabine:.3f} s  {eyring:.3f} s   {100 * (values.mean() / eyring - 1):+6.1f} %"
+            f"  {centre:5.0f} Hz  {thirty.mean():.3f} +/- {thirty.std():.3f} s   "
+            f"{twenty.mean():.3f} +/- {twenty.std():.3f} s   "
+            f"{sabine:.3f} s  {eyring:.3f} s   {100 * (thirty.mean() / eyring - 1):+6.1f} %"
         )
 
     print(

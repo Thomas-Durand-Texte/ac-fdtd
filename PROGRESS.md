@@ -47,6 +47,8 @@ the modal frequencies by about as much as the discretisation error being measure
 
 ![M1 validation](docs/figures/m1_box_validation.svg)
 
+*Left: the scheme's own modal frequency approaching the analytical one as `dx²` — three modes, with the `dx²` slope drawn through the axis curve. Centre: relative deviation of the discrete energy from its starting value, for the correct staggered form and for the naive `p² + v²` one; the dashed line is double-precision epsilon. Right: transfer function of a rigid box from a pulse at one corner, with the analytical mode frequencies drawn as vertical lines.*
+
 **Energy conservation.** Rigid box 0.8 x 0.65 x 0.55 m, `dx = 50 mm`:
 
 | initial condition | Courant | steps | relative energy drift |
@@ -151,6 +153,8 @@ three 1D profiles, no extra field, and is applied only to the slabs where it dif
 ### Results
 
 ![M2 validation](docs/figures/m2_boundaries.svg)
+
+*Left: measured reflection magnitude of a wall against frequency, for three normalised admittances ξ; the dashed lines are the theoretical `(1−ξ)/(1+ξ)`. Centre: error the absorbing layer injects into a free-field simulation, against how many clear cells separate the receiver from the layer, for two layer thicknesses — isolated by re-running the same problem in a domain large enough that its own walls cannot answer. Right: monopole waveforms at three distances, scaled by `r` so the 1/r decay is divided out and the three collapse onto one; the analytical Green's function is dashed underneath and invisible because it coincides.*
 
 **Absorbing walls, normal incidence.** Pulse down a one-cell duct, gated into incident and
 reflected arrivals, mean over 60 Hz – 2 kHz:
@@ -278,6 +282,8 @@ from the fast one, so reading it as the low-frequency speed would make the Coura
 
 ![M3 validation](docs/figures/m3_air_absorption.svg)
 
+*Left: ISO 9613-1 attenuation against frequency at three relative humidities (lines) with the simulated values measured in a duct (circles). Centre: the simulation's error against the standard, plotted against grid resolution rather than frequency; all three humidities overlap, which is the sign that what remains is the grid and not the air. Right: what the attenuation is worth — level lost along a path of 5, 20 and 100 m, against a 1 dB reference.*
+
 A pulse down a 20 m duct at `dx = 2 mm`, recorded 16 m apart and differenced. The measurement
 works because dispersion changes a spectrum's phase and not its magnitude, so the ratio of two
 magnitude spectra sees the attenuation alone.
@@ -346,25 +352,33 @@ property of the input, not a simplification.
 
 ![M4 validation](docs/figures/m4_reverberation.svg)
 
+*Left: the impulse response itself — direct sound, early reflections, decay. Centre: backward-integrated energy decay in three octave bands, with the two fit ranges shaded: TR20 is fitted from −5 to −25 dB, TR30 from −5 to −35. Right: reverberation time per octave band, measured (TR30 solid, TR20 dotted, error bars over eight source–receiver pairs) against Sabine and Eyring; the shaded region is below the Schroeder frequency, where a room is a set of individual modes and statistical theory does not apply.*
+
 Room 3.2 x 2.7 x 2.3 m (19.9 m³), walls at 0.15 normal-incidence absorption, 20 °C / 50 % RH,
 grid 108 x 91 x 78 at 29.6 mm, 2 sources x 4 receivers:
 
-| octave band | simulated T20 | Sabine | Eyring | vs Eyring |
-| --- | --- | --- | --- | --- |
-| 125 Hz | 0.335 ± 0.019 s | 0.286 | 0.248 | **+35 %** |
-| 250 Hz | 0.266 ± 0.038 s | 0.285 | 0.248 | +7.4 % |
-| 500 Hz | 0.261 ± 0.035 s | 0.285 | 0.247 | +5.6 % |
-| 1000 Hz | 0.267 ± 0.026 s | 0.284 | 0.247 | +8.4 % |
+| octave band | simulated TR30 | simulated TR20 | Sabine | Eyring | TR30 vs Eyring |
+| --- | --- | --- | --- | --- | --- |
+| 125 Hz | 0.321 ± 0.017 s | 0.335 ± 0.019 s | 0.286 | 0.248 | **+29 %** |
+| 250 Hz | 0.283 ± 0.016 s | 0.266 ± 0.038 s | 0.285 | 0.248 | +14 % |
+| 500 Hz | 0.256 ± 0.017 s | 0.261 ± 0.035 s | 0.285 | 0.247 | +3.7 % |
+| 1000 Hz | 0.266 ± 0.021 s | 0.267 ± 0.026 s | 0.284 | 0.247 | +8.0 % |
 
-Above the Schroeder frequency (223 Hz) the simulation sits between Eyring and Sabine, nearer
-Eyring, within 6–8 %. That is as close as statistical theory gets to a real room, and closer
-than the spread between source-receiver positions in a measurement.
+Both evaluation ranges are quoted: TR20 fits the decay from −5 to −25 dB, TR30 from −5 to −35.
+TR30 uses more of the decay and is the more robust of the two — visible here in the spread
+across positions, which it roughly halves in three bands out of four — so it is the one to read.
+Where they disagree, the decay is not a single straight line.
 
-The 125 Hz band is 35 % away, and **that is the correct answer**. The Schroeder frequency is
-223 Hz; below it a room is a handful of separately decaying modes rather than a diffuse field,
-and Sabine's derivation does not apply. The small spread across the eight positions (± 0.019 s)
-confirms it is a property of the room and not measurement scatter. Agreement in that band would
-have meant the simulation was reproducing the formula rather than the physics.
+Above the Schroeder frequency (223 Hz) the simulation sits between Eyring and Sabine, within
+4–8 % of Eyring at 500 Hz and 1 kHz. The 250 Hz band is 14 % out, and it is the band that
+straddles the crossover: its lower edge is 177 Hz, below the Schroeder frequency, so part of
+what it measures is modal rather than diffuse.
+
+The 125 Hz band is 29 % away, and **that is the correct answer**. Below the Schroeder frequency
+a room is a handful of separately decaying modes rather than a diffuse field, and Sabine's
+derivation does not apply. The small spread across the eight positions (± 0.017 s) confirms it
+is a property of the room and not measurement scatter. Agreement in that band would have meant
+the simulation was reproducing the formula rather than the physics.
 
 ### The trap that cost the most here
 
@@ -586,6 +600,8 @@ order because the first one matters more.
 
 ![Dispersion](docs/figures/m7_dispersion.svg)
 
+*Left: phase velocity error against grid resolution for three propagation directions. The axes are the worst case and the body diagonal is exact — it has no error to plot, so it is drawn along the bottom of the frame and labelled. The dashed line is an `n⁻²` slope through the axis curve. Centre: the same error over an octant of propagation directions at ten points per wavelength, showing the four-fold anisotropy — largest along the axes (marked), zero at the body diagonal (marked). Right: the design rule — resolution needed to hold the error below a target, for three Courant numbers; running below the stability limit costs resolution rather than buying safety.*
+
 The dispersion relation is closed-form, so none of this needs a simulation:
 
 ```
@@ -628,6 +644,8 @@ the spread between the fastest and slowest backend measured below.
 ### Backends
 
 ![Backends](docs/figures/backends.svg)
+
+*Left: throughput against grid size for every backend; colour is the backend family, dashes distinguish precision or device. Centre: the same runs expressed as memory traffic achieved, against each device's measured streaming ceiling — the backends sit at comparable fractions of the hardware, and differ mainly in how many bytes their formulation has to move. Right: what a 5 × 4 × 3 m room costs, in hours of compute per second of impulse response, against the bandwidth resolved.*
 
 Throughput in Gcell-updates/s, absorbing walls, steps per size chosen to time about 0.4 G
 cell-updates each so a small grid is not timed over three milliseconds:
@@ -776,6 +794,8 @@ already measured), then fourth order (a further 6.8x, design known), then hardwa
 ### An example, because a table is not a picture
 
 ![Wavefront](docs/figures/wavefront.svg)
+
+*Four snapshots of a horizontal slice through the source, on a common colour scale so the decay between panels is visible; the first is clipped, by the factor given in its title. Blue is rarefaction, orange compression. The expanding wavefront, the first reflections arriving from each wall, and by 28 ms an interference pattern that is the beginning of a reverberant field.*
 
 A pulse crossing a 4 x 3 x 2.5 m room: the expanding wavefront, the first reflections arriving
 from each wall, and by 28 ms an interference pattern that is the beginning of a reverberant

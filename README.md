@@ -7,9 +7,11 @@ where an exact answer exists, and then made fast enough to be useful.
 
 ![A pulse crossing a room](docs/figures/wavefront.svg)
 
-*A pulse crossing a 4 × 3 × 2.5 m room. The expanding wavefront, the first reflections arriving
-from each wall, and by 28 ms the interference pattern that is the beginning of a reverberant
-field.*
+*Four snapshots of a horizontal slice through the source in a 4 × 3 × 2.5 m room, on a common
+colour scale so the decay between panels is visible; the first is clipped, by the factor given
+in its title. Blue is rarefaction, orange compression. The expanding wavefront, the first
+reflections arriving from each wall, and by 28 ms an interference pattern that is the beginning
+of a reverberant field.*
 
 ---
 
@@ -21,7 +23,7 @@ field.*
 - **Air.** The full ISO 9613-1 attenuation — classical losses plus oxygen and nitrogen
   relaxation — as a property of the medium, parameterised by temperature, humidity and pressure.
 - **Output.** Band-limited excitation, deconvolution, receivers, wav export at 48 kHz, and the
-  usual room-acoustics parameters: Schroeder decay, T20/T30, EDT, C50.
+  usual room-acoustics parameters: Schroeder decay, TR20/TR30, EDT, C50.
 - **Speed.** Three interchangeable backends — NumPy (reference), PyTorch (CPU/MPS/CUDA), and a
   compiled C loop — plus a pressure-only variant five times faster again.
 
@@ -58,15 +60,22 @@ with conditions and figures, is in [`PROGRESS.md`](PROGRESS.md).
 | Free-field monopole | spherical Green's function | **0.21 %** at 61 points/wavelength |
 | Wall reflection coefficient | `(1−ξ)/(1+ξ)` | within **0.005** of theory |
 | Air absorption | ISO 9613-1, 20–80 % RH | within **1.2 %** above 20 points/wavelength |
-| Reverberation time | Sabine and Eyring | **6–8 %** of Eyring above the Schroeder frequency |
+| Reverberation time (TR30) | Sabine and Eyring | **4–8 %** of Eyring above the Schroeder frequency |
 
 The last row is the only one whose reference is not exact, and it is the interesting one: below
-the Schroeder frequency the simulation departs from Sabine by 35 %, **which is the correct
+the Schroeder frequency the simulation departs from Sabine by 29 %, **which is the correct
 answer**. A small room there is a handful of separately decaying modes rather than a diffuse
 field, and Sabine's derivation does not apply. Agreement in that band would have meant the code
 was reproducing the formula instead of the physics.
 
 ![Reverberation time against Sabine and Eyring](docs/figures/m4_reverberation.svg)
+
+*Left: the impulse response itself — direct sound, early reflections, decay. Centre:
+backward-integrated energy decay in three octave bands, with the two fit ranges shaded: TR20 is
+fitted from −5 to −25 dB, TR30 from −5 to −35. Right: reverberation time per octave band,
+measured (TR30 solid, TR20 dotted, error bars over eight source–receiver pairs) against Sabine
+and Eyring. The shaded region is below the Schroeder frequency — the frequency above which modes
+overlap enough for statistical theory to mean anything.*
 
 ---
 
@@ -74,9 +83,17 @@ was reproducing the formula instead of the physics.
 
 ### 1. The half time step between pressure and velocity is not an implementation detail
 
-Pressure lives at whole steps and velocity at half steps, so anything combining them — energy,
-intensity, a boundary condition — has to name an instant. Getting it wrong does not blow up; it
-quietly biases the result by O(dt).
+![The staggered grid in space and time](docs/figures/staggering.svg)
+
+*Left: where each field lives in space — pressure at cell centres, each velocity component on
+the faces it flows through, which is what puts a rigid wall exactly on the boundary plane.
+Right: where each lives in time. Pressure is known at whole steps and velocity at half steps;
+one step updates velocity from the pressure gradient, then pressure from the velocity
+divergence. The ringed pair is what the solver holds at any moment.*
+
+The two fields are never known at the same instant, so anything combining them — energy,
+intensity, a boundary condition — has to name one. Getting it wrong does not blow up; it quietly
+biases the result by O(dt).
 
 That discipline pays for itself through the **energy identity**. With rigid walls the discrete
 divergence and gradient are exact negative adjoints, so the discrete energy is conserved
@@ -118,14 +135,23 @@ device.** Not the order the hardware specifications suggest.
 
 ![Dispersion](docs/figures/m7_dispersion.svg)
 
+*Left: phase velocity error against grid resolution for three propagation directions. The axes
+are the worst case; the body diagonal is exact, so it has no error to plot and is drawn along
+the bottom of the frame and labelled. The dashed line is an `n⁻²` slope through the axis curve.
+Centre: the same error over an octant of propagation directions at ten points per wavelength —
+largest along the axes (marked), zero at the body diagonal (marked). Right: the design rule —
+resolution needed to hold the error below a target, for three Courant numbers.*
+
 The scheme's dispersion relation is closed-form, so this costs nothing to compute. At the
 stability limit the scheme is **exact along the body diagonal** — not small, zero, at every
 resolution — while the axes are the worst case. Ten points per wavelength buys 1.1 % phase
 velocity error; 1 % costs 10.5 points.
 
-That also settles the Courant number. Running below the limit is not a safety margin: it breaks
-the cancellation and needs 60 % more cells *and* twice the steps for the same accuracy. Three
-times the run time to be more careful, spent on being less accurate.
+That also settles the **Courant number** — the time step as a fraction of the largest stable
+one, `C = c · dt · √3 / dx` in three dimensions, so `C = 1` sits exactly at the stability limit.
+Backing off from it looks like prudence and is not: it breaks the cancellation that makes the
+body diagonal exact, and then needs 60 % more cells *and* twice the steps for the same accuracy.
+Three times the run time to be more careful, spent on being less accurate.
 
 Since cost scales as the fourth power of bandwidth, this is the highest-leverage number in the
 project — halving the required resolution is worth 16× in run time, more than the spread
@@ -142,23 +168,6 @@ between the fastest and slowest backend.
 
 ---
 
-## Two traps that made correct code look wrong
-
-Both were found by comparing against a closed-form answer, and neither was caught by a test.
-
-**Sabine's formula wants the random-incidence absorption coefficient; a wall admittance is
-defined at normal incidence.** A locally reacting surface absorbs far more obliquely — 0.15
-head-on is 0.252 averaged over angle, a factor of 1.7 in predicted reverberation time. The first
-comparison showed a measured T60 of half the prediction and looked like a serious boundary bug.
-The boundaries were right.
-
-**`1.2 / 0.01` is `119.99999999999999`.** So a plain floor put a point on a cell boundary one
-cell low, while `0.5 / 0.01` is exact and did not. Two grids of the same spacing disagreed about
-where the same point was; it surfaced as a 7 % amplitude error in a free-field comparison and
-looked like physics.
-
----
-
 ## Layout
 
 ```
@@ -168,7 +177,7 @@ src/ac_fdtd/
   air.py          ISO 9613-1, and the relaxing medium that has its attenuation
   dispersion.py   what the grid does to the speed of sound
   room.py         the short path: a room, a source, an impulse response
-  metrics.py      Schroeder, T20/T30, EDT, C50, Sabine, Eyring
+  metrics.py      Schroeder, TR20/TR30, EDT, C50, Sabine, Eyring
   torch_backend.py · c_backend.py · c/acfdtd.c
 scripts/          one per study; each regenerates its own figure
 tests/            100 tests, including cross-backend parity

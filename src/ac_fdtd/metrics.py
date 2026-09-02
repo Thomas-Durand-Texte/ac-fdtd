@@ -85,18 +85,22 @@ def _decay_slope(decay: np.ndarray, sample_rate: float, upper: float, lower: flo
 def reverberation_time(
     response: np.ndarray, sample_rate: float, evaluation_range: float = 20.0
 ) -> float:
-    """T20 or T30, extrapolated to 60 dB, in seconds.
+    """TR20 or TR30, extrapolated to 60 dB, in seconds.
+
+    ``evaluation_range`` is how many decibels of decay the straight line is fitted over: 20 for
+    TR20, 30 for TR30. TR30 uses more of the decay and is the more robust of the two; the two
+    disagreeing is the standard sign that a decay is not a single straight line.
 
     The fit starts 5 dB below the peak, as the convention requires: the first few decibels are
     the direct sound and the early reflections, which are not the reverberant decay and would
-    bias the slope if included.
+    bias the slope if included. (ISO 3382 writes these T20 and T30; TR is the same quantity.)
     """
     decay = schroeder_decay(response)
     return _decay_slope(decay, sample_rate, -5.0, -5.0 - evaluation_range)
 
 
 def early_decay_time(response: np.ndarray, sample_rate: float) -> float:
-    """EDT: the first 10 dB, extrapolated to 60. Closer to what a listener hears than T30."""
+    """EDT: the first 10 dB, extrapolated to 60. Closer to what a listener hears than TR30."""
     decay = schroeder_decay(response)
     return _decay_slope(decay, sample_rate, 0.0, -10.0)
 

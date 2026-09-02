@@ -31,7 +31,7 @@ __all__ = ["Room", "ImpulseResponse", "simulate_impulse_response"]
 #: second-order scheme; `PROGRESS.md` records what the error actually is at that resolution.
 DEFAULT_POINTS_PER_WAVELENGTH = 10.0
 
-#: Run length as a multiple of the estimated reverberation time. T30 needs 35 dB of clean
+#: Run length as a multiple of the estimated reverberation time. TR30 needs 35 dB of clean
 #: decay, and a fit is only as good as its tail.
 DEFAULT_DURATION_FACTOR = 1.5
 
@@ -136,7 +136,7 @@ def simulate_impulse_response(
         max_frequency: Bandwidth to resolve. This sets the grid spacing, and through it the
             time step, the memory and most of the run time — cost scales as its fourth power.
         duration: Seconds to simulate. Defaults to 1.5 times Sabine's estimate, which is enough
-            decay for a T30 fit.
+            decay for a TR30 fit.
         points_per_wavelength: Spatial resolution at ``max_frequency``.
         courant: Fraction of the stability limit. Leave at 1.
     """

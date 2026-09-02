@@ -19,7 +19,7 @@ and when; this file is the current picture and gets rewritten.
 | Air | ISO 9613-1: classical + O₂ + N₂ relaxation, from temperature / humidity / pressure |
 | Sources | Band-limited impulse, Gaussian pulse, soft volume source, deconvolution |
 | Receivers | Pressure probes on all backends; velocity probes on the reference |
-| Analysis | Schroeder decay, T20/T30, EDT, C50, octave bands, Sabine/Eyring, Schroeder frequency |
+| Analysis | Schroeder decay, TR20/TR30, EDT, C50, octave bands, Sabine/Eyring, Schroeder frequency |
 | Export | Polyphase resampling and 32-bit float wav |
 | Backends | NumPy (fp64), PyTorch (CPU/MPS/CUDA, fp32/fp64), C (pthreads, fp32/fp64) |
 | Variant | Pressure-only C kernel, rigid walls only, ~5× the pressure–velocity form |
