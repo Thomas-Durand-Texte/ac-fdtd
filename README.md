@@ -1,9 +1,9 @@
-# ac-fdtd
+# Room Impulse Responses from First Principles
 
-**Room impulse responses from first principles.** A 3D finite-difference time-domain solver for
-linear acoustics: a staggered pressure–velocity scheme with locally reacting walls, an absorbing
-layer for free field, and ISO 9613-1 air absorption — validated at every step against cases
-where an exact answer exists, and then made fast enough to be useful.
+**A 3D finite-difference time-domain solver for linear acoustics** — a staggered
+pressure–velocity scheme with locally reacting walls, an absorbing layer for free field, and
+ISO 9613-1 air absorption, validated at every step against cases where an exact answer exists,
+and then made fast enough to be useful.
 
 ![A pulse crossing a room](docs/figures/wavefront.svg)
 
