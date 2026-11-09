@@ -127,3 +127,76 @@ def test_a_soft_source_conserves_nothing_but_stays_bounded():
     assert np.isfinite(solver.p).all()
     assert solver.energy() > 0.0
     assert np.max(np.abs(solver.p)) < 1e6
+
+
+def test_a_prescribed_pressure_source_holds_its_node_then_frees_it():
+    """Inside the window the node equals the signal exactly; after it, it is a free node again."""
+    solver = _box()
+    signal = np.random.default_rng(3).standard_normal(15)
+    point = (0.4, 0.3, 0.25)
+    solver.add_prescribed_source(point, signal, kind="pressure")
+    index = solver.grid.cell_index(point)
+
+    for k in range(signal.size):
+        solver.step()
+        assert solver.p[index] == pytest.approx(signal[k]), k
+
+    # Released: the node is no longer pinned, so over a few further steps it moves off the last
+    # held value rather than staying clamped to it.
+    held = solver.p[index]
+    values = []
+    for _ in range(5):
+        solver.step()
+        values.append(solver.p[index])
+    assert any(v != held for v in values)
+
+
+def test_a_prescribed_velocity_source_drives_the_field_from_rest():
+    """A velocity face driven from silence does work on the fluid and radiates pressure."""
+    solver = _box()
+    signal = np.full(10, 0.01)
+    point = (0.4, 0.3, 0.25)
+    axis = 0
+    solver.add_prescribed_source(point, signal, kind="velocity", axis=axis)
+    index = solver.grid.cell_index(point)
+
+    assert solver.energy() == 0.0
+    solver.step()
+    # The driven face holds exactly the prescribed value this step...
+    assert solver.velocity[axis][index] == pytest.approx(signal[0])
+    # ...and it has already radiated: pressure is no longer uniformly zero.
+    assert np.any(solver.p != 0.0)
+
+    solver.run(20)
+    assert np.isfinite(solver.p).all()
+    assert solver.energy() > 0.0
+
+
+def test_a_prescribed_source_is_inert_outside_its_window():
+    """Nothing happens before ``start``; the first sample lands exactly on step ``start``."""
+    solver = _box()
+    signal = np.array([1.0, 1.0, 1.0])
+    point = (0.4, 0.3, 0.25)
+    solver.add_prescribed_source(point, signal, start=5, kind="pressure")
+    index = solver.grid.cell_index(point)
+
+    solver.run(5)  # steps 0..4, strictly before the window
+    assert solver.energy() == 0.0
+    assert solver.p[index] == 0.0
+
+    solver.step()  # step 5: the window's first sample is imposed
+    assert solver.p[index] == pytest.approx(1.0)
+
+
+def test_prescribed_source_rejects_contradictory_arguments():
+    solver = _box()
+    signal = np.ones(4)
+    point = (0.1, 0.1, 0.1)
+    with pytest.raises(ValueError):
+        solver.add_prescribed_source(point, signal, kind="velocity")  # axis missing
+    with pytest.raises(ValueError):
+        solver.add_prescribed_source(point, signal, kind="pressure", axis=0)  # axis with pressure
+    with pytest.raises(ValueError):
+        solver.add_prescribed_source(point, signal, kind="nonsense")
+    with pytest.raises(ValueError):
+        solver.add_prescribed_source(point, signal, start=-1)

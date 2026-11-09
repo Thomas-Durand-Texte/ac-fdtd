@@ -148,6 +148,13 @@ class AcousticFDTD:
         self._sources: list[tuple[tuple[int, int, int], np.ndarray]] = []
         self._receivers: list[tuple[tuple[int, int, int], list[float]]] = []
 
+        # Prescribed (hard) sources: a node held equal to a signal for a window of steps, then
+        # released. Kept apart from the soft sources above because they overwrite rather than
+        # add, and at a different point in the step — velocity before the pressure update that
+        # reads it, pressure after its own update — so each enters exactly once.
+        self._prescribed_velocity: list[tuple[int, tuple[int, int, int], int, np.ndarray]] = []
+        self._prescribed_pressure: list[tuple[tuple[int, int, int], int, np.ndarray]] = []
+
         # Absorbing walls: the two coefficients of the closed-form solve, on the boundary cells
         # only. Empty arrays when every wall is rigid, and then the whole mechanism costs one
         # `if` per step.
@@ -243,6 +250,57 @@ class AcousticFDTD:
         index = self.grid.cell_index(point)
         self._sources.append((index, np.asarray(signal, dtype=self.dtype)))
 
+    def add_prescribed_source(
+        self,
+        point: tuple[float, float, float],
+        signal: np.ndarray,
+        start: int = 0,
+        kind: str = "pressure",
+        axis: int | None = None,
+    ) -> None:
+        """Hold one node equal to ``signal`` for a window of steps, then let it go.
+
+        The *hard* counterpart to :meth:`add_volume_source`. Inside the window the node is
+        overwritten with the signal *after* the normal update, so it radiates exactly the
+        prescribed history; outside ``[start, start + len(signal))`` the node is advanced by the
+        equations like any other, with no special case. A finite window is therefore "driven
+        while active, free node afterwards" — a loudspeaker switched on and then released.
+
+        ``kind="pressure"`` overwrites the pressure of the cell containing ``point``.
+        ``kind="velocity"`` overwrites one velocity component (``axis`` required) on the lower
+        face of that cell — the same face :meth:`probe_velocity` reads, half a cell towards the
+        origin. A velocity source placed on a boundary plane the interior update never touches
+        (a wall face) persists as set from step to step, which is the driven-wall / piston case.
+
+        Being hard, a prescribed source conserves no energy and scatters waves that return to
+        it; that is the point of it, and why the soft source is kept for additive,
+        non-scattering injection.
+
+        Args:
+            point: Position in metres; mapped to a cell by :meth:`Grid.cell_index`.
+            signal: One sample per step. Its length is the window length.
+            start: Step index at which the window opens. Sample ``k`` is imposed on step
+                ``start + k`` — for velocity, the ``v^{n+1/2}`` computed on that step; for
+                pressure, the ``p^{n+1}`` it produces.
+            kind: ``"pressure"`` or ``"velocity"``.
+            axis: Velocity component ``0``/``1``/``2`` for ``kind="velocity"``; must be ``None``
+                for pressure.
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        samples = np.asarray(signal, dtype=self.dtype)
+        index = self.grid.cell_index(point)
+        if kind == "pressure":
+            if axis is not None:
+                raise ValueError("axis is meaningless for a pressure source; leave it None")
+            self._prescribed_pressure.append((index, start, samples))
+        elif kind == "velocity":
+            if axis not in (0, 1, 2):
+                raise ValueError(f"velocity source needs axis in (0, 1, 2), got {axis!r}")
+            self._prescribed_velocity.append((axis, index, start, samples))
+        else:
+            raise ValueError(f"kind must be 'pressure' or 'velocity', got {kind!r}")
+
     def add_pressure_receiver(self, point: tuple[float, float, float]) -> int:
         """Record the pressure at ``point`` every step from now on, and return its channel.
 
@@ -288,9 +346,11 @@ class AcousticFDTD:
         self._damp(self.velocity[0], self._velocity_damping[0])
         self._damp(self.velocity[1], self._velocity_damping[1])
         self._damp(self.velocity[2], self._velocity_damping[2])
+        self._apply_prescribed_velocity()
         self._update_pressure()
         self._damp(self.p, self._pressure_damping)
         self._inject_sources()
+        self._apply_prescribed_pressure()
         self.step_index += 1
         for index, samples in self._receivers:
             samples.append(self.p[index])
@@ -361,6 +421,24 @@ class AcousticFDTD:
         for index, signal in self._sources:
             if self.step_index < len(signal):
                 self.p[index] += self._source_coefficient * signal[self.step_index]
+
+    def _apply_prescribed_velocity(self) -> None:
+        """Overwrite each driven velocity face, after the update that would move it and before
+        the pressure update that reads it, so the prescribed value is what radiates this step."""
+        step = self.step_index
+        for axis, index, start, signal in self._prescribed_velocity:
+            offset = step - start
+            if 0 <= offset < signal.size:
+                self.velocity[axis][index] = signal[offset]
+
+    def _apply_prescribed_pressure(self) -> None:
+        """Overwrite each driven pressure cell last, after its own update and any damping, so a
+        receiver sharing the node reads the prescribed value rather than the freely-updated one."""
+        step = self.step_index
+        for index, start, signal in self._prescribed_pressure:
+            offset = step - start
+            if 0 <= offset < signal.size:
+                self.p[index] = signal[offset]
 
     def energy(self) -> float:
         """Total acoustic energy of the stored state, in joules.

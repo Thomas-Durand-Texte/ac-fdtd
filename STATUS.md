@@ -12,12 +12,12 @@ and when; this file is the current picture and gets rewritten.
 
 | Area | State |
 | --- | --- |
-| Scheme | Staggered pressure–velocity, 2nd order in space and time, Courant 1 by default |
+| Scheme | Staggered pressure–velocity, 2nd order in space and time, Courant 1 by default; a 2D peer `AcousticFDTD2D` (Courant 1/√2) with the same walls, layer, air and exact energy identity |
 | Geometry | Rectangular rooms; a grid rounds each axis to whole cells and reports what it built |
 | Walls | Rigid, locally reacting real admittance, impedance-matched; from an absorption coefficient or directly |
 | Free field | Graded matched absorbing layer, any subset of the six faces |
 | Air | ISO 9613-1: classical + O₂ + N₂ relaxation, from temperature / humidity / pressure |
-| Sources | Band-limited impulse, Gaussian pulse, soft volume source, deconvolution |
+| Sources | Band-limited impulse, Gaussian pulse, soft volume source, deconvolution; prescribed (hard) pressure/velocity sources with a time window (`add_prescribed_source`, reference backend) |
 | Receivers | Pressure probes on all backends; velocity probes on the reference |
 | Analysis | Schroeder decay, TR20/TR30, EDT, C50, octave bands, Sabine/Eyring, Schroeder frequency |
 | Export | Polyphase resampling and 32-bit float wav |
@@ -82,3 +82,11 @@ commit. Pushing happens outside the sandbox.
 
 **Figures.** Every script writes its own SVG into `docs/figures/`. They are committed, so a
 figure and the text around it should be regenerated together.
+
+**2D scheme.** A full-fidelity NumPy reference (`grid2d`/`boundaries2d`/`scheme2d`/`analytic2d`,
+class `AcousticFDTD2D`) mirrors the 3D scheme: rigid + locally-reacting absorbing walls, matched
+layer, air relaxation, soft and prescribed (hard) sources, pressure receivers, and the exact energy
+identity — tested the same way (energy to round-off, a single mode staying sinusoidal, second-order
+dispersion). It is the plane mode for the front end and the spec a 2D C/WASM kernel will mirror next
+(same derivation, for larger grids and the in-browser demo). The C/Torch backends gain prescribed
+sources and the 2D kernel in follow-up work; the reference leads.
