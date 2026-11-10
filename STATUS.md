@@ -21,7 +21,7 @@ and when; this file is the current picture and gets rewritten.
 | Receivers | Pressure probes on all backends; velocity probes on the reference |
 | Analysis | Schroeder decay, TR20/TR30, EDT, C50, octave bands, Sabine/Eyring, Schroeder frequency |
 | Export | Polyphase resampling and 32-bit float wav |
-| Backends | NumPy (fp64), PyTorch (CPU/MPS/CUDA, fp32/fp64), C (pthreads, fp32/fp64) |
+| Backends | NumPy (fp64), PyTorch (CPU/MPS/CUDA, fp32/fp64), C (pthreads, fp32/fp64); 2D has NumPy + a C kernel (`CAcousticFDTD2D`), no Torch yet |
 | Variant | Pressure-only C kernel, rigid walls only, ~5× the pressure–velocity form |
 
 ## What is deliberately not there
@@ -87,6 +87,10 @@ figure and the text around it should be regenerated together.
 class `AcousticFDTD2D`) mirrors the 3D scheme: rigid + locally-reacting absorbing walls, matched
 layer, air relaxation, soft and prescribed (hard) sources, pressure receivers, and the exact energy
 identity — tested the same way (energy to round-off, a single mode staying sinusoidal, second-order
-dispersion). It is the plane mode for the front end and the spec a 2D C/WASM kernel will mirror next
-(same derivation, for larger grids and the in-browser demo). The C/Torch backends gain prescribed
-sources and the 2D kernel in follow-up work; the reference leads.
+dispersion). It is the plane mode for the front end. A **compiled C kernel** (`CAcousticFDTD2D`, pthreads,
+fp32/fp64, in the same `acfdtd.c`/`c_backend.py` as the 3D one) now matches the reference to
+round-off — parity-tested across rigid / absorbing walls / matched layer / air — so 2D runs fast at
+scale as well (`scripts/backend_benchmark_2d.py`: ~6 GCU/s fp32 on the M2 Ultra). Remaining 2D
+follow-ups: a **WASM build** (for the in-browser demo) and a **Torch/MPS** path (large planes); the
+prescribed-source hook on the C/Torch backends is still pending for both 2D and 3D. The reference
+leads; the compiled kernels mirror it.

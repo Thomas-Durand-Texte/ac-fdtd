@@ -476,3 +476,162 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
         s->previous = swap;
     }
 }
+
+/* ============================================================= the 2D kernel ============ */
+
+/* The plane counterpart of the pressure-velocity kernel above: two velocity components instead
+ * of three, the inner (contiguous) axis is y, and the cell measure is an area. The derivation,
+ * the stored-state pairing (p^n, v^{n-1/2}), and the wall / layer / relaxation treatment are all
+ * identical to the 3D kernel and to ac_fdtd.scheme2d; only the indexing loses an axis. The struct
+ * is mirrored field for field by a ctypes Structure, and acfdtd2d_struct_size lets a test check
+ * that the two still agree. It shares the one thread pool, so there is nothing new below the
+ * sweeps. */
+
+typedef struct {
+    int32_t nx, ny;
+    int32_t n_relax;
+    int64_t n_wall;
+    int64_t n_sources;
+    int64_t n_receivers;
+    int64_t n_steps;
+    int64_t source_length;
+
+    REAL vel_coef;
+    REAL pres_coef;
+    REAL src_coef;
+    REAL relax_scale;
+
+    REAL *p;
+    REAL *vx;
+    REAL *vy;
+    REAL *psi; /* n_relax planes of nx*ny */
+
+    REAL relax_decay[MAX_RELAXATION];
+    REAL relax_mean[MAX_RELAXATION];
+    REAL relax_gain[MAX_RELAXATION];
+
+    const REAL *cell[2];
+    const REAL *face[2];
+    int32_t has_layer;
+
+    const int64_t *wall_index;
+    const REAL *wall_from_updated;
+    const REAL *wall_from_previous;
+    REAL *wall_scratch;
+
+    const int64_t *source_index;
+    const REAL *source_signal;
+
+    const int64_t *receiver_index;
+    REAL *recording;
+} acfdtd2d;
+
+size_t acfdtd2d_struct_size(void) { return sizeof(acfdtd2d); }
+
+/* Velocity, layer damping folded in. vx owns the lower face on the outer axis (i), vy the lower
+ * face on the inner axis (j); the loop bounds hold the four wall faces at zero without a test. */
+static void update_velocity_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    const REAL c = s->vel_coef;
+
+    for (int32_t i = i_start; i < i_end; i++) {
+        const REAL fx = s->cell[0][i];
+        const REAL *p = s->p + (int64_t)i * ny;
+
+        REAL *vy = s->vy + (int64_t)i * (ny + 1);
+        for (int32_t j = 1; j < ny; j++)
+            vy[j] = (vy[j] - c * (p[j] - p[j - 1])) * (fx * s->face[1][j]);
+
+        if (i >= 1) {
+            REAL *vx = s->vx + (int64_t)i * ny;
+            const REAL *pi = p - ny;
+            const REAL gx = s->face[0][i];
+            for (int32_t j = 0; j < ny; j++)
+                vx[j] = (vx[j] - c * (p[j] - pi[j])) * (gx * s->cell[1][j]);
+        }
+    }
+}
+
+/* Pressure, including the relaxation states; no layer damping here, for the same reason as 3D. */
+static void update_pressure_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    const int64_t n_cells = (int64_t)s->nx * ny;
+    const REAL coef = s->pres_coef;
+    const int32_t n_relax = s->n_relax;
+
+    for (int32_t i = i_start; i < i_end; i++) {
+        const int64_t row = (int64_t)i * ny;
+        REAL *p = s->p + row;
+        const REAL *vx = s->vx + row;
+        const REAL *vx_next = s->vx + row + ny;
+        const REAL *vy = s->vy + (int64_t)i * (ny + 1);
+
+        for (int32_t j = 0; j < ny; j++) {
+            const REAL divergence = (vx_next[j] - vx[j]) + (vy[j + 1] - vy[j]);
+
+            REAL added = s->relax_scale * divergence;
+            for (int32_t r = 0; r < n_relax; r++) {
+                REAL *state = s->psi + (int64_t)r * n_cells + row;
+                const REAL target = s->relax_gain[r] * divergence;
+                const REAL offset = state[j] - target;
+                state[j] = target + s->relax_decay[r] * offset;
+                added += s->relax_mean[r] * offset;
+            }
+            p[j] += added - coef * divergence;
+        }
+    }
+}
+
+static void damp_pressure_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    for (int32_t i = i_start; i < i_end; i++) {
+        REAL *p = s->p + (int64_t)i * ny;
+        const REAL g = s->cell[0][i];
+        for (int32_t j = 0; j < ny; j++) p[j] *= g * s->cell[1][j];
+    }
+}
+
+static void velocity_sweep_2d(const void *state, int32_t start, int32_t end) {
+    update_velocity_2d((const acfdtd2d *)state, start, end);
+}
+static void pressure_sweep_2d(const void *state, int32_t start, int32_t end) {
+    update_pressure_2d((const acfdtd2d *)state, start, end);
+}
+static void damping_sweep_2d(const void *state, int32_t start, int32_t end) {
+    damp_pressure_2d((const acfdtd2d *)state, start, end);
+}
+
+static void gather_walls_2d(const acfdtd2d *s) {
+    for (int64_t w = 0; w < s->n_wall; w++) s->wall_scratch[w] = s->p[s->wall_index[w]];
+}
+
+static void finish_walls_2d(const acfdtd2d *s) {
+    for (int64_t w = 0; w < s->n_wall; w++) {
+        const int64_t index = s->wall_index[w];
+        s->p[index] = s->p[index] * s->wall_from_updated[w] -
+                      s->wall_scratch[w] * s->wall_from_previous[w];
+    }
+}
+
+void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
+    if (n_threads == 0) acfdtd_set_threads(0);
+
+    for (int64_t step = 0; step < s->n_steps; step++) {
+        const int64_t absolute = step_offset + step;
+
+        dispatch(s, velocity_sweep_2d, s->nx);
+
+        if (s->n_wall) gather_walls_2d(s);
+        dispatch(s, pressure_sweep_2d, s->nx);
+        if (s->n_wall) finish_walls_2d(s);
+        if (s->has_layer) dispatch(s, damping_sweep_2d, s->nx);
+
+        for (int64_t source = 0; source < s->n_sources; source++)
+            if (absolute < s->source_length)
+                s->p[s->source_index[source]] +=
+                    s->src_coef * s->source_signal[source * s->source_length + absolute];
+
+        for (int64_t receiver = 0; receiver < s->n_receivers; receiver++)
+            s->recording[receiver * s->n_steps + step] = s->p[s->receiver_index[receiver]];
+    }
+}

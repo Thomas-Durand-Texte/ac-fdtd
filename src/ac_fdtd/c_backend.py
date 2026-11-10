@@ -30,10 +30,24 @@ import numpy as np
 
 from .air import AirAbsorption
 from .boundaries import AbsorbingLayer, WallAdmittances, layer_factors, wall_update_coefficients
+from .boundaries2d import (
+    AbsorbingLayer2D,
+    WallAdmittances2D,
+    layer_factors_2d,
+    wall_update_coefficients_2d,
+)
 from .grid import Grid, max_stable_time_step
+from .grid2d import Grid2D, max_stable_time_step_2d
 from .medium import AIR, Medium
 
-__all__ = ["CAcousticFDTD", "CScalarFDTD", "build", "build_report", "is_available"]
+__all__ = [
+    "CAcousticFDTD",
+    "CAcousticFDTD2D",
+    "CScalarFDTD",
+    "build",
+    "build_report",
+    "is_available",
+]
 
 _SOURCE = Path(__file__).resolve().parent / "c" / "acfdtd.c"
 _MAX_RELAXATION = 4
@@ -91,6 +105,8 @@ def _library(dtype: np.dtype) -> ctypes.CDLL:
         library.acfdtd_set_threads.argtypes = [ctypes.c_int]
         library.acfdtd_is_double.restype = ctypes.c_int
         library.acfdtd_run.restype = None
+        library.acfdtd2d_struct_size.restype = ctypes.c_size_t
+        library.acfdtd2d_run.restype = None
         _libraries[key] = library
     return _libraries[key]
 
@@ -157,6 +173,48 @@ def _structure(dtype: np.dtype) -> type[ctypes.Structure]:
         ]
 
     return State
+
+
+def _structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
+    real = ctypes.c_double if dtype == np.float64 else ctypes.c_float
+    pointer = ctypes.POINTER(real)
+    index_pointer = ctypes.POINTER(ctypes.c_int64)
+
+    class State2D(ctypes.Structure):
+        _fields_ = [
+            ("nx", ctypes.c_int32),
+            ("ny", ctypes.c_int32),
+            ("n_relax", ctypes.c_int32),
+            ("n_wall", ctypes.c_int64),
+            ("n_sources", ctypes.c_int64),
+            ("n_receivers", ctypes.c_int64),
+            ("n_steps", ctypes.c_int64),
+            ("source_length", ctypes.c_int64),
+            ("vel_coef", real),
+            ("pres_coef", real),
+            ("src_coef", real),
+            ("relax_scale", real),
+            ("p", pointer),
+            ("vx", pointer),
+            ("vy", pointer),
+            ("psi", pointer),
+            ("relax_decay", real * _MAX_RELAXATION),
+            ("relax_mean", real * _MAX_RELAXATION),
+            ("relax_gain", real * _MAX_RELAXATION),
+            ("cell", pointer * 2),
+            ("face", pointer * 2),
+            ("has_layer", ctypes.c_int32),
+            ("wall_index", index_pointer),
+            ("wall_from_updated", pointer),
+            ("wall_from_previous", pointer),
+            ("wall_scratch", pointer),
+            ("source_index", index_pointer),
+            ("source_signal", pointer),
+            ("receiver_index", index_pointer),
+            ("recording", pointer),
+        ]
+
+    return State2D
 
 
 def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
@@ -399,6 +457,210 @@ class CAcousticFDTD:
             coupling += float(np.sum(component[interior] * gradient))
 
         return cell_volume * (potential + kinetic - 0.5 * self.dt * coupling)
+
+
+class CAcousticFDTD2D:
+    """The 2D staggered scheme with its time loop compiled (``ac_fdtd.scheme2d`` in C).
+
+    Same physics and same ``(p^n, v^{n-1/2})`` pairing as
+    :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`; the fields are ordinary NumPy arrays that C writes
+    into. As with the 3D kernel, :meth:`run` is the unit of work rather than ``step``, and the two
+    share the one compiled library and its thread pool.
+    """
+
+    def __init__(
+        self,
+        grid: Grid2D,
+        medium: Medium = AIR,
+        courant: float = 1.0,
+        dtype: np.dtype = np.float64,
+        walls: WallAdmittances2D | None = None,
+        absorbing_layer: AbsorbingLayer2D | None = None,
+        air_absorption: AirAbsorption | None = None,
+    ) -> None:
+        if not 0.0 < courant <= 1.0:
+            raise ValueError(f"courant must be in (0, 1], got {courant}")
+
+        self.grid = grid
+        self.medium = medium
+        self.courant = courant
+        self.dtype = np.dtype(dtype)
+        self.walls = walls or WallAdmittances2D()
+        self.absorbing_layer = absorbing_layer
+        self.air_absorption = air_absorption
+        self.dt = courant * max_stable_time_step_2d(grid.dx, medium.sound_speed)
+        self.step_index = 0
+
+        self._library = _library(self.dtype)
+        self._state_type = _structure_2d(self.dtype)
+        if ctypes.sizeof(self._state_type) != self._library.acfdtd2d_struct_size():
+            raise RuntimeError(
+                "the ctypes mirror of the 2D C struct no longer matches the C definition: "
+                f"{ctypes.sizeof(self._state_type)} bytes here, "
+                f"{self._library.acfdtd2d_struct_size()} bytes there"
+            )
+
+        self.p = np.zeros(grid.shape, dtype=self.dtype)
+        self.velocity = [np.zeros(grid.velocity_shape(axis), dtype=self.dtype) for axis in range(2)]
+
+        processes = air_absorption.processes(medium.sound_speed, self.dt) if air_absorption else ()
+        if len(processes) > _MAX_RELAXATION:
+            raise ValueError(f"the kernel holds at most {_MAX_RELAXATION} relaxation processes")
+        self._relaxation_states = np.zeros((len(processes), *grid.shape), dtype=self.dtype)
+
+        relaxed_speed_squared = medium.sound_speed**2 / (
+            1.0 + sum(process.strength for process in processes)
+        )
+        self._decay = np.zeros(_MAX_RELAXATION)
+        self._mean = np.zeros(_MAX_RELAXATION)
+        self._gain = np.zeros(_MAX_RELAXATION)
+        for slot, process in enumerate(processes):
+            decay = math.exp(-self.dt / process.relaxation_time)
+            self._decay[slot] = decay
+            self._mean[slot] = self.dt * (process.relaxation_time / self.dt) * (1.0 - decay)
+            self._gain[slot] = medium.density * relaxed_speed_squared * process.strength / grid.dx
+        self._relaxation_scale = self.dt * float(self._gain.sum())
+
+        indices, coefficient = wall_update_coefficients_2d(grid, medium, self.dt, self.walls)
+        self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
+        self._wall_from_updated = (1.0 / (1.0 + coefficient)).astype(self.dtype)
+        self._wall_from_previous = (coefficient / (1.0 + coefficient)).astype(self.dtype)
+        self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
+
+        if absorbing_layer is None:
+            self._cell = [np.ones(grid.shape[axis], dtype=self.dtype) for axis in range(2)]
+            self._face = [np.ones(grid.shape[axis] + 1, dtype=self.dtype) for axis in range(2)]
+        else:
+            pressure_factors, velocity_factors = layer_factors_2d(
+                grid, medium, self.dt, absorbing_layer
+            )
+            self._cell = [pressure_factors[axis].astype(self.dtype) for axis in range(2)]
+            self._face = [velocity_factors[axis][axis].astype(self.dtype) for axis in range(2)]
+
+        self._source_index = np.zeros(0, dtype=np.int64)
+        self._source_signal = np.zeros((0, 0), dtype=self.dtype)
+        self._receiver_index = np.zeros(0, dtype=np.int64)
+        self._recordings: list[np.ndarray] = []
+
+    @property
+    def sample_rate(self) -> float:
+        return 1.0 / self.dt
+
+    @property
+    def time(self) -> float:
+        return self.step_index * self.dt
+
+    @property
+    def threads(self) -> int:
+        return int(self._library.acfdtd_thread_count())
+
+    def set_threads(self, count: int) -> int:
+        return int(self._library.acfdtd_set_threads(int(count)))
+
+    def add_volume_source(self, point: tuple[float, float], signal: np.ndarray) -> None:
+        """Add a volume-velocity source; signals are zero-padded to a common length, as in 3D."""
+        flat = int(np.ravel_multi_index(self.grid.cell_index(point), self.grid.shape))
+        signal = np.asarray(signal, dtype=self.dtype)
+        length = max(self._source_signal.shape[1], signal.size)
+
+        padded = np.zeros((self._source_signal.shape[0] + 1, length), dtype=self.dtype)
+        padded[:-1, : self._source_signal.shape[1]] = self._source_signal
+        padded[-1, : signal.size] = signal
+
+        self._source_index = np.append(self._source_index, flat)
+        self._source_signal = padded
+
+    def add_pressure_receiver(self, point: tuple[float, float]) -> int:
+        flat = int(np.ravel_multi_index(self.grid.cell_index(point), self.grid.shape))
+        self._receiver_index = np.append(self._receiver_index, flat)
+        return self._receiver_index.size - 1
+
+    @property
+    def recorded_pressure(self) -> np.ndarray:
+        if not self._recordings:
+            return np.zeros((self._receiver_index.size, 0))
+        return np.concatenate(self._recordings, axis=1)
+
+    def _pointer(self, array: np.ndarray):
+        real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
+        return array.ctypes.data_as(ctypes.POINTER(real))
+
+    def _indices(self, array: np.ndarray):
+        return array.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+
+    def run(self, n_steps: int) -> None:
+        """Advance ``n_steps`` inside the compiled 2D loop."""
+        if n_steps <= 0:
+            return
+
+        recording = np.zeros((self._receiver_index.size, n_steps), dtype=self.dtype)
+        real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
+        pointer_array = ctypes.POINTER(real) * 2
+        array4 = (ctypes.c_double * 4) if self.dtype == np.float64 else (ctypes.c_float * 4)
+
+        state = self._state_type(
+            nx=self.grid.nx,
+            ny=self.grid.ny,
+            n_relax=self._relaxation_states.shape[0],
+            n_wall=self._wall_index.size,
+            n_sources=self._source_index.size,
+            n_receivers=self._receiver_index.size,
+            n_steps=n_steps,
+            source_length=self._source_signal.shape[1],
+            vel_coef=self.dt / (self.medium.density * self.grid.dx),
+            pres_coef=self.medium.density * self.medium.sound_speed**2 * self.dt / self.grid.dx,
+            src_coef=self.medium.density * self.medium.sound_speed**2 * self.dt,
+            relax_scale=self._relaxation_scale,
+            p=self._pointer(self.p),
+            vx=self._pointer(self.velocity[0]),
+            vy=self._pointer(self.velocity[1]),
+            psi=self._pointer(self._relaxation_states),
+            relax_decay=array4(*self._decay),
+            relax_mean=array4(*self._mean),
+            relax_gain=array4(*self._gain),
+            cell=pointer_array(*[self._pointer(profile) for profile in self._cell]),
+            face=pointer_array(*[self._pointer(profile) for profile in self._face]),
+            has_layer=int(self.absorbing_layer is not None),
+            wall_index=self._indices(self._wall_index),
+            wall_from_updated=self._pointer(self._wall_from_updated),
+            wall_from_previous=self._pointer(self._wall_from_previous),
+            wall_scratch=self._pointer(self._wall_scratch),
+            source_index=self._indices(self._source_index),
+            source_signal=self._pointer(self._source_signal),
+            receiver_index=self._indices(self._receiver_index),
+            recording=self._pointer(recording),
+        )
+
+        self._library.acfdtd2d_run(ctypes.byref(state), ctypes.c_int64(self.step_index))
+        self.step_index += n_steps
+        if self._receiver_index.size:
+            self._recordings.append(recording)
+
+    def step(self) -> None:
+        self.run(1)
+
+    def energy(self) -> float:
+        """Total acoustic energy per metre of depth, for the stored ``(p^n, v^{n-1/2})`` pairing."""
+        medium = self.medium
+        cell_area = self.grid.dx**2
+
+        potential = float(np.dot(self.p.ravel(), self.p.ravel())) / (
+            2.0 * medium.density * medium.sound_speed**2
+        )
+
+        kinetic = 0.0
+        coupling = 0.0
+        for axis in range(2):
+            component = self.velocity[axis]
+            flat = component.ravel()
+            kinetic += 0.5 * medium.density * float(np.dot(flat, flat))
+            upper = tuple(slice(1, None) if a == axis else slice(None) for a in range(2))
+            lower = tuple(slice(None, -1) if a == axis else slice(None) for a in range(2))
+            interior = tuple(slice(1, -1) if a == axis else slice(None) for a in range(2))
+            gradient = (self.p[upper] - self.p[lower]) / self.grid.dx
+            coupling += float(np.sum(component[interior] * gradient))
+
+        return cell_area * (potential + kinetic - 0.5 * self.dt * coupling)
 
 
 class CScalarFDTD:
