@@ -100,4 +100,7 @@ velocity face touching a solid is held at zero (`v·n = 0`) before the pressure 
 an obstacle of any staircased shape is a lossless rigid reflector and the energy identity is
 unchanged (`tests/test_obstacles2d.py`: energy conserved with an obstacle, a barrier seals the far
 side, a shadow forms). The front end voxelises geometry (e.g. a Helmholtz resonator) into this mask.
-Not yet: the mask on the compiled/Torch kernels, a 3D mask, or absorbing (non-rigid) masked surfaces.
+The compiled 2D kernel takes the mask too (`CAcousticFDTD2D(rigid_cells=…)`): two extra 0/1-masking
+sweeps per step, skipped when there is none, parity-tested against the reference including an
+obstacle in an absorbing room (`tests/test_c_backend_2d.py`). Not yet: the mask on the 3D / Torch
+kernels, a 3D mask, or absorbing (non-rigid) masked surfaces.
