@@ -212,6 +212,10 @@ def _structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
             ("source_signal", pointer),
             ("receiver_index", index_pointer),
             ("recording", pointer),
+            ("vx_open", pointer),
+            ("vy_open", pointer),
+            ("p_keep", pointer),
+            ("has_rigid", ctypes.c_int32),
         ]
 
     return State2D
@@ -466,6 +470,11 @@ class CAcousticFDTD2D:
     :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`; the fields are ordinary NumPy arrays that C writes
     into. As with the 3D kernel, :meth:`run` is the unit of work rather than ``step``, and the two
     share the one compiled library and its thread pool.
+
+    ``rigid_cells`` carries interior rigid obstacles exactly as in the reference scheme: a boolean
+    mask of solid cells whose touching velocity faces are held at ``v.n = 0``. It composes with
+    absorbing walls and the layer (the resonator-in-an-absorbing-room case), and the compiled run
+    is the same computation as :class:`~ac_fdtd.scheme2d.AcousticFDTD2D` with the same mask.
     """
 
     def __init__(
@@ -477,6 +486,7 @@ class CAcousticFDTD2D:
         walls: WallAdmittances2D | None = None,
         absorbing_layer: AbsorbingLayer2D | None = None,
         air_absorption: AirAbsorption | None = None,
+        rigid_cells: np.ndarray | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -541,6 +551,28 @@ class CAcousticFDTD2D:
         self._source_signal = np.zeros((0, 0), dtype=self.dtype)
         self._receiver_index = np.zeros(0, dtype=np.int64)
         self._recordings: list[np.ndarray] = []
+
+        # Rigid obstacles as 0/1 factors the C sweeps multiply by (see the reference scheme for the
+        # construction). When there is no mask the flag is off and the sweeps are skipped, so the
+        # single-element placeholders below only exist to keep the struct pointers valid.
+        self._has_rigid = rigid_cells is not None
+        if rigid_cells is None:
+            self._vx_open = np.ones(1, dtype=self.dtype)
+            self._vy_open = np.ones(1, dtype=self.dtype)
+            self._p_keep = np.ones(1, dtype=self.dtype)
+        else:
+            rigid = np.ascontiguousarray(rigid_cells, dtype=bool)
+            if rigid.shape != grid.shape:
+                raise ValueError(
+                    f"rigid_cells shape {rigid.shape} does not match the grid {grid.shape}"
+                )
+            vx_open = np.ones(grid.velocity_shape(0), dtype=self.dtype)
+            vx_open[1:-1, :] = ~(rigid[:-1, :] | rigid[1:, :])
+            vy_open = np.ones(grid.velocity_shape(1), dtype=self.dtype)
+            vy_open[:, 1:-1] = ~(rigid[:, :-1] | rigid[:, 1:])
+            self._vx_open = np.ascontiguousarray(vx_open.reshape(-1))
+            self._vy_open = np.ascontiguousarray(vy_open.reshape(-1))
+            self._p_keep = np.ascontiguousarray((~rigid).astype(self.dtype).reshape(-1))
 
     @property
     def sample_rate(self) -> float:
@@ -629,6 +661,10 @@ class CAcousticFDTD2D:
             source_signal=self._pointer(self._source_signal),
             receiver_index=self._indices(self._receiver_index),
             recording=self._pointer(recording),
+            vx_open=self._pointer(self._vx_open),
+            vy_open=self._pointer(self._vy_open),
+            p_keep=self._pointer(self._p_keep),
+            has_rigid=int(self._has_rigid),
         )
 
         self._library.acfdtd2d_run(ctypes.byref(state), ctypes.c_int64(self.step_index))

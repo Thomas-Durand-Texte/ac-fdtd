@@ -524,6 +524,16 @@ typedef struct {
 
     const int64_t *receiver_index;
     REAL *recording;
+
+    /* Rigid interior obstacles. A velocity face touching a solid cell is held at zero every step
+     * (v.n = 0, the same condition that makes the domain's own walls rigid), and a solid cell's
+     * pressure is held at zero. The two masks carry that as 0/1 factors so the sweeps stay
+     * branchless: `vx_open`/`vy_open` are the open-face factors on the two velocity grids, and
+     * `p_keep` is zero on solid cells. All absent when `has_rigid` is 0, which costs nothing. */
+    const REAL *vx_open; /* (nx+1)*ny: 0 on x-faces touching a solid, else 1 */
+    const REAL *vy_open; /* nx*(ny+1): 0 on y-faces touching a solid, else 1 */
+    const REAL *p_keep;  /* nx*ny: 0 on solid cells, else 1 */
+    int32_t has_rigid;
 } acfdtd2d;
 
 size_t acfdtd2d_struct_size(void) { return sizeof(acfdtd2d); }
@@ -591,6 +601,37 @@ static void damp_pressure_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) 
     }
 }
 
+/* Hold the velocity at zero on every face touching a solid cell, after the velocity update and
+ * before the pressure update reads it. Multiplying by the 0/1 open-face masks is v.n = 0 on those
+ * faces and a no-op everywhere else; it follows the write pattern of update_velocity_2d so a thread
+ * touches only its own block. The boundary faces are already zero, so masking them is harmless. */
+static void mask_velocity_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    for (int32_t i = i_start; i < i_end; i++) {
+        REAL *vy = s->vy + (int64_t)i * (ny + 1);
+        const REAL *vyo = s->vy_open + (int64_t)i * (ny + 1);
+        for (int32_t j = 0; j < ny + 1; j++) vy[j] *= vyo[j];
+
+        if (i >= 1) {
+            REAL *vx = s->vx + (int64_t)i * ny;
+            const REAL *vxo = s->vx_open + (int64_t)i * ny;
+            for (int32_t j = 0; j < ny; j++) vx[j] *= vxo[j];
+        }
+    }
+}
+
+/* Hold the pressure at zero on solid cells, as the last field operation of the step. With every
+ * bounding face already zeroed this is what the divergence would give anyway; it is applied
+ * explicitly so the recorded state has exact zeros inside solids. */
+static void zero_rigid_pressure_2d(const acfdtd2d *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    for (int32_t i = i_start; i < i_end; i++) {
+        REAL *p = s->p + (int64_t)i * ny;
+        const REAL *keep = s->p_keep + (int64_t)i * ny;
+        for (int32_t j = 0; j < ny; j++) p[j] *= keep[j];
+    }
+}
+
 static void velocity_sweep_2d(const void *state, int32_t start, int32_t end) {
     update_velocity_2d((const acfdtd2d *)state, start, end);
 }
@@ -599,6 +640,12 @@ static void pressure_sweep_2d(const void *state, int32_t start, int32_t end) {
 }
 static void damping_sweep_2d(const void *state, int32_t start, int32_t end) {
     damp_pressure_2d((const acfdtd2d *)state, start, end);
+}
+static void mask_velocity_sweep_2d(const void *state, int32_t start, int32_t end) {
+    mask_velocity_2d((const acfdtd2d *)state, start, end);
+}
+static void zero_pressure_sweep_2d(const void *state, int32_t start, int32_t end) {
+    zero_rigid_pressure_2d((const acfdtd2d *)state, start, end);
 }
 
 static void gather_walls_2d(const acfdtd2d *s) {
@@ -620,6 +667,7 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
         const int64_t absolute = step_offset + step;
 
         dispatch(s, velocity_sweep_2d, s->nx);
+        if (s->has_rigid) dispatch(s, mask_velocity_sweep_2d, s->nx);
 
         if (s->n_wall) gather_walls_2d(s);
         dispatch(s, pressure_sweep_2d, s->nx);
@@ -630,6 +678,8 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
             if (absolute < s->source_length)
                 s->p[s->source_index[source]] +=
                     s->src_coef * s->source_signal[source * s->source_length + absolute];
+
+        if (s->has_rigid) dispatch(s, zero_pressure_sweep_2d, s->nx);
 
         for (int64_t receiver = 0; receiver < s->n_receivers; receiver++)
             s->recording[receiver * s->n_steps + step] = s->p[s->receiver_index[receiver]];

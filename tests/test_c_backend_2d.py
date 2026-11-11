@@ -16,15 +16,30 @@ GRID = Grid2D.from_lengths((0.6, 0.5), 0.03)
 SOURCE = (0.2, 0.2)
 RECEIVER = (0.4, 0.3)
 
+
+def _obstacle_mask() -> np.ndarray:
+    """A solid block off to one side — an interior rigid obstacle to exercise the masked sweeps."""
+    nx, ny = GRID.shape
+    mask = np.zeros(GRID.shape, dtype=bool)
+    mask[nx // 2 : nx // 2 + 3, ny // 3 : 2 * ny // 3] = True
+    return mask
+
+
 CONFIGURATIONS = {
     "rigid": {},
     "absorbing walls": {"walls": WallAdmittances2D.uniform(0.3)},
     "absorbing layer": {"absorbing_layer": AbsorbingLayer2D(thickness=4)},
     "air absorption": {"air_absorption": AirAbsorption()},
+    "rigid obstacle": {"rigid_cells": _obstacle_mask()},
+    "obstacle in an absorbing room": {
+        "rigid_cells": _obstacle_mask(),
+        "walls": WallAdmittances2D.uniform(0.4),
+    },
     "everything at once": {
         "walls": WallAdmittances2D(x_min=0.2, y_max=0.7),
         "absorbing_layer": AbsorbingLayer2D(thickness=3),
         "air_absorption": AirAbsorption(temperature=15.0, relative_humidity=70.0),
+        "rigid_cells": _obstacle_mask(),
     },
 }
 
