@@ -69,6 +69,10 @@ class AcousticFDTD2D:
         walls: Normalised admittance of each of the four walls. Default is rigid throughout.
         absorbing_layer: Graded matched layer for free-field runs; combines with ``walls``.
         air_absorption: ISO-9613-1 atmospheric absorption, or ``None`` for lossless air.
+        rigid_cells: Boolean mask of grid shape marking solid interior cells (rigid obstacles).
+            ``None`` (default) is an empty domain. Every velocity face touching a solid cell is held
+            at zero (``v.n = 0``), so obstacles are lossless rigid reflectors of any shape and the
+            energy identity still holds; the geometry that produces the mask is the caller's job.
     """
 
     def __init__(
@@ -80,6 +84,7 @@ class AcousticFDTD2D:
         walls: WallAdmittances2D | None = None,
         absorbing_layer: AbsorbingLayer2D | None = None,
         air_absorption: AirAbsorption | None = None,
+        rigid_cells: np.ndarray | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -167,6 +172,27 @@ class AcousticFDTD2D:
                         velocity_factors[component][axis].astype(self.dtype), axis
                     )
                 ]
+
+        # Rigid interior obstacles: a boolean mask of solid cells. A velocity face between a solid
+        # cell and any cell is held at zero every step, which is v.n = 0 — the same thing that makes
+        # the domain's own walls rigid. The face is zeroed before the pressure update reads it, so
+        # the value the update put there never feeds back: it is equivalent to never updating that
+        # face, so an obstacle is a lossless reflector and the energy identity is unchanged. With
+        # every bounding face at zero a solid cell's divergence is zero, so its pressure stays zero.
+        self._rigid_cells: np.ndarray | None = None
+        self._vx_open: np.ndarray | None = None
+        self._vy_open: np.ndarray | None = None
+        if rigid_cells is not None:
+            rigid = np.ascontiguousarray(rigid_cells, dtype=bool)
+            if rigid.shape != grid.shape:
+                raise ValueError(
+                    f"rigid_cells shape {rigid.shape} does not match the grid {grid.shape}"
+                )
+            self._rigid_cells = rigid
+            self._vx_open = np.ones(grid.velocity_shape(0), dtype=self.dtype)
+            self._vx_open[1:-1, :] = ~(rigid[:-1, :] | rigid[1:, :])
+            self._vy_open = np.ones(grid.velocity_shape(1), dtype=self.dtype)
+            self._vy_open[:, 1:-1] = ~(rigid[:, :-1] | rigid[:, 1:])
 
     @property
     def vx(self) -> np.ndarray:
@@ -264,10 +290,14 @@ class AcousticFDTD2D:
         self._damp(self.velocity[0], self._velocity_damping[0])
         self._damp(self.velocity[1], self._velocity_damping[1])
         self._apply_prescribed_velocity()
+        if self._rigid_cells is not None:
+            self._apply_rigid_velocity()
         self._update_pressure()
         self._damp(self.p, self._pressure_damping)
         self._inject_sources()
         self._apply_prescribed_pressure()
+        if self._rigid_cells is not None:
+            self.p[self._rigid_cells] = 0.0
         self.step_index += 1
         for index, samples in self._receivers:
             samples.append(self.p[index])
@@ -276,6 +306,11 @@ class AcousticFDTD2D:
     def _damp(field: np.ndarray, slabs: list[tuple[tuple[slice, ...], np.ndarray]]) -> None:
         for index, factor in slabs:
             field[index] *= factor
+
+    def _apply_rigid_velocity(self) -> None:
+        """Hold the velocity at zero on every face touching a solid cell (``v.n = 0``)."""
+        self.velocity[0] *= self._vx_open
+        self.velocity[1] *= self._vy_open
 
     def run(self, n_steps: int) -> None:
         for _ in range(n_steps):

@@ -13,7 +13,7 @@ and when; this file is the current picture and gets rewritten.
 | Area | State |
 | --- | --- |
 | Scheme | Staggered pressure–velocity, 2nd order in space and time, Courant 1 by default; a 2D peer `AcousticFDTD2D` (Courant 1/√2) with the same walls, layer, air and exact energy identity |
-| Geometry | Rectangular rooms; a grid rounds each axis to whole cells and reports what it built |
+| Geometry | Rectangular rooms; a grid rounds each axis to whole cells and reports what it built. 2D also takes a **rigid-cell mask** (`AcousticFDTD2D(rigid_cells=…)`): lossless interior obstacles of any staircased shape |
 | Walls | Rigid, locally reacting real admittance, impedance-matched; from an absorption coefficient or directly |
 | Free field | Graded matched absorbing layer, any subset of the six faces |
 | Air | ISO 9613-1: classical + O₂ + N₂ relaxation, from temperature / humidity / pressure |
@@ -94,3 +94,10 @@ scale as well (`scripts/backend_benchmark_2d.py`: ~6 GCU/s fp32 on the M2 Ultra)
 follow-ups: a **WASM build** (for the in-browser demo) and a **Torch/MPS** path (large planes); the
 prescribed-source hook on the C/Torch backends is still pending for both 2D and 3D. The reference
 leads; the compiled kernels mirror it.
+
+**Rigid obstacles (2D).** `AcousticFDTD2D` takes `rigid_cells`, a boolean mask of solid cells. Each
+velocity face touching a solid is held at zero (`v·n = 0`) before the pressure update reads it, so
+an obstacle of any staircased shape is a lossless rigid reflector and the energy identity is
+unchanged (`tests/test_obstacles2d.py`: energy conserved with an obstacle, a barrier seals the far
+side, a shadow forms). The front end voxelises geometry (e.g. a Helmholtz resonator) into this mask.
+Not yet: the mask on the compiled/Torch kernels, a 3D mask, or absorbing (non-rigid) masked surfaces.
