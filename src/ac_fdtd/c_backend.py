@@ -216,6 +216,16 @@ def _structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
             ("vy_open", pointer),
             ("p_keep", pointer),
             ("has_rigid", ctypes.c_int32),
+            ("n_pres_pressure", ctypes.c_int64),
+            ("n_pres_velocity", ctypes.c_int64),
+            ("pres_length", ctypes.c_int64),
+            ("pp_index", index_pointer),
+            ("pp_start", index_pointer),
+            ("pp_signal", pointer),
+            ("pv_axis", ctypes.POINTER(ctypes.c_int32)),
+            ("pv_index", index_pointer),
+            ("pv_start", index_pointer),
+            ("pv_signal", pointer),
         ]
 
     return State2D
@@ -574,6 +584,12 @@ class CAcousticFDTD2D:
             self._vy_open = np.ascontiguousarray(vy_open.reshape(-1))
             self._p_keep = np.ascontiguousarray((~rigid).astype(self.dtype).reshape(-1))
 
+        # Prescribed (hard) sources, the counterpart of the reference scheme's prescribed sources.
+        # (flat index, start, signal) for pressure, and (axis, flat index, start, signal) for
+        # velocity. Flat indices are into p / vx / vy; they are packed into matrices in run().
+        self._pressure_sources: list[tuple[int, int, np.ndarray]] = []
+        self._velocity_sources: list[tuple[int, int, int, np.ndarray]] = []
+
     @property
     def sample_rate(self) -> float:
         return 1.0 / self.dt
@@ -607,6 +623,38 @@ class CAcousticFDTD2D:
         self._receiver_index = np.append(self._receiver_index, flat)
         return self._receiver_index.size - 1
 
+    def add_prescribed_source(
+        self,
+        point: tuple[float, float],
+        signal: np.ndarray,
+        start: int = 0,
+        kind: str = "pressure",
+        axis: int | None = None,
+    ) -> None:
+        """Hard-drive a node for a window of steps (see ``AcousticFDTD2D.add_prescribed_source``).
+
+        The same contract as the reference scheme: a ``pressure`` node is set after the volume
+        sources, a ``velocity`` face (``axis`` 0 or 1) before the pressure update reads it. The flat
+        index is into the pressure field or the chosen velocity grid, computed here so the kernel
+        just writes it.
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        samples = np.asarray(signal, dtype=self.dtype)
+        cell = self.grid.cell_index(point)
+        if kind == "pressure":
+            if axis is not None:
+                raise ValueError("axis is meaningless for a pressure source; leave it None")
+            flat = int(np.ravel_multi_index(cell, self.grid.shape))
+            self._pressure_sources.append((flat, start, samples))
+        elif kind == "velocity":
+            if axis not in (0, 1):
+                raise ValueError(f"velocity source needs axis in (0, 1), got {axis!r}")
+            flat = int(np.ravel_multi_index(cell, self.grid.velocity_shape(axis)))
+            self._velocity_sources.append((axis, flat, start, samples))
+        else:
+            raise ValueError(f"kind must be 'pressure' or 'velocity', got {kind!r}")
+
     @property
     def recorded_pressure(self) -> np.ndarray:
         if not self._recordings:
@@ -629,6 +677,24 @@ class CAcousticFDTD2D:
         real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
         pointer_array = ctypes.POINTER(real) * 2
         array4 = (ctypes.c_double * 4) if self.dtype == np.float64 else (ctypes.c_float * 4)
+
+        # Pack the prescribed sources into matrices the kernel reads row by row (kept alive as
+        # locals through the C call). pres_length is their common, zero-padded window length.
+        pres_length = max(
+            [0, *(sig.size for _, _, sig in self._pressure_sources)]
+            + [sig.size for _, _, _, sig in self._velocity_sources]
+        )
+        pp_index = np.array([i for i, _, _ in self._pressure_sources], dtype=np.int64)
+        pp_start = np.array([s for _, s, _ in self._pressure_sources], dtype=np.int64)
+        pp_signal = np.zeros((len(self._pressure_sources), pres_length), dtype=self.dtype)
+        for row, (_, _, sig) in enumerate(self._pressure_sources):
+            pp_signal[row, : sig.size] = sig
+        pv_axis = np.array([a for a, _, _, _ in self._velocity_sources], dtype=np.int32)
+        pv_index = np.array([i for _, i, _, _ in self._velocity_sources], dtype=np.int64)
+        pv_start = np.array([s for _, _, s, _ in self._velocity_sources], dtype=np.int64)
+        pv_signal = np.zeros((len(self._velocity_sources), pres_length), dtype=self.dtype)
+        for row, (_, _, _, sig) in enumerate(self._velocity_sources):
+            pv_signal[row, : sig.size] = sig
 
         state = self._state_type(
             nx=self.grid.nx,
@@ -665,6 +731,16 @@ class CAcousticFDTD2D:
             vy_open=self._pointer(self._vy_open),
             p_keep=self._pointer(self._p_keep),
             has_rigid=int(self._has_rigid),
+            n_pres_pressure=len(self._pressure_sources),
+            n_pres_velocity=len(self._velocity_sources),
+            pres_length=pres_length,
+            pp_index=self._indices(pp_index),
+            pp_start=self._indices(pp_start),
+            pp_signal=self._pointer(pp_signal),
+            pv_axis=pv_axis.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            pv_index=self._indices(pv_index),
+            pv_start=self._indices(pv_start),
+            pv_signal=self._pointer(pv_signal),
         )
 
         self._library.acfdtd2d_run(ctypes.byref(state), ctypes.c_int64(self.step_index))

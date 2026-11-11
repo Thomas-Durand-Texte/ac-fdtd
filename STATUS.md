@@ -91,9 +91,11 @@ dispersion). It is the plane mode for the front end. A **compiled C kernel** (`C
 fp32/fp64, in the same `acfdtd.c`/`c_backend.py` as the 3D one) now matches the reference to
 round-off — parity-tested across rigid / absorbing walls / matched layer / air — so 2D runs fast at
 scale as well (`scripts/backend_benchmark_2d.py`: ~6 GCU/s fp32 on the M2 Ultra). Remaining 2D
-follow-ups: a **WASM build** (for the in-browser demo) and a **Torch/MPS** path (large planes); the
-prescribed-source hook on the C/Torch backends is still pending for both 2D and 3D. The reference
-leads; the compiled kernels mirror it.
+follow-ups: a **WASM build** (for the in-browser demo) and a **Torch/MPS** path (large planes). The
+2D C kernel now has **prescribed (hard) sources** too — `CAcousticFDTD2D.add_prescribed_source`,
+pressure and velocity, parity-tested against the reference — so a driven piston / pressure source
+(a shaped loudspeaker) runs on C; the hook is still pending on the 3D C kernel and on Torch. The
+reference leads; the compiled kernels mirror it.
 
 **Rigid obstacles (2D).** `AcousticFDTD2D` takes `rigid_cells`, a boolean mask of solid cells. Each
 velocity face touching a solid is held at zero (`v·n = 0`) before the pressure update reads it, so

@@ -79,6 +79,27 @@ def test_matches_the_reference(name):
     )
 
 
+def test_prescribed_sources_match_the_reference():
+    """A driven velocity piston and a pressure node must step exactly like the reference scheme."""
+    signal = np.exp(-(((np.arange(200) - 30) / 8.0) ** 2))
+
+    def build(cls):
+        solver = cls(GRID, walls=WallAdmittances2D.uniform(0.3))
+        for j in (5, 6, 7):  # a short velocity piston (axis 0) and a pressure node
+            solver.add_prescribed_source((0.2, j * 0.03), signal, kind="velocity", axis=0)
+        solver.add_prescribed_source((0.4, 0.3), signal, kind="pressure")
+        solver.add_pressure_receiver(RECEIVER)
+        return solver
+
+    reference, candidate = build(AcousticFDTD2D), build(c_backend.CAcousticFDTD2D)
+    reference.run(150)
+    candidate.run(150)
+    np.testing.assert_allclose(candidate.p, reference.p, rtol=1e-11, atol=1e-13)
+    np.testing.assert_allclose(
+        candidate.recorded_pressure, reference.recorded_pressure, rtol=1e-11, atol=1e-13
+    )
+
+
 def test_single_precision_tracks_the_reference_loosely():
     """fp32 cannot match to 1e-11, but it must still be the same computation to a few ulp/step."""
     reference, candidate = _paired(dtype=np.float32, walls=WallAdmittances2D.uniform(0.2))

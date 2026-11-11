@@ -534,6 +534,23 @@ typedef struct {
     const REAL *vy_open; /* nx*(ny+1): 0 on y-faces touching a solid, else 1 */
     const REAL *p_keep;  /* nx*ny: 0 on solid cells, else 1 */
     int32_t has_rigid;
+
+    /* Prescribed (hard) sources — the counterpart of add_prescribed_source in the reference scheme,
+     * the building block of a shaped velocity/pressure source. Each one overwrites a node inside its
+     * window [start, start+pres_length): a pressure source sets p; a velocity source sets vx or vy
+     * (its axis). Indices are flat offsets into the matching array. The signals are rows of
+     * pres_length. Timing matches the reference: velocity before the pressure update reads it,
+     * pressure as the last write before the rigid-cell clamp. */
+    int64_t n_pres_pressure;
+    int64_t n_pres_velocity;
+    int64_t pres_length;
+    const int64_t *pp_index;
+    const int64_t *pp_start;
+    const REAL *pp_signal; /* n_pres_pressure rows of pres_length */
+    const int32_t *pv_axis;
+    const int64_t *pv_index;
+    const int64_t *pv_start;
+    const REAL *pv_signal; /* n_pres_velocity rows of pres_length */
 } acfdtd2d;
 
 size_t acfdtd2d_struct_size(void) { return sizeof(acfdtd2d); }
@@ -660,6 +677,27 @@ static void finish_walls_2d(const acfdtd2d *s) {
     }
 }
 
+/* Overwrite the prescribed velocity faces for this step, after the velocity update and before the
+ * pressure update reads them (a driven piston). Serial: the count is small and scattered. */
+static void apply_prescribed_velocity_2d(const acfdtd2d *s, int64_t absolute) {
+    for (int64_t k = 0; k < s->n_pres_velocity; k++) {
+        const int64_t offset = absolute - s->pv_start[k];
+        if (offset >= 0 && offset < s->pres_length) {
+            REAL *v = (s->pv_axis[k] == 0) ? s->vx : s->vy;
+            v[s->pv_index[k]] = s->pv_signal[k * s->pres_length + offset];
+        }
+    }
+}
+
+/* Overwrite the prescribed pressure nodes, after the volume sources and before the rigid clamp. */
+static void apply_prescribed_pressure_2d(const acfdtd2d *s, int64_t absolute) {
+    for (int64_t k = 0; k < s->n_pres_pressure; k++) {
+        const int64_t offset = absolute - s->pp_start[k];
+        if (offset >= 0 && offset < s->pres_length)
+            s->p[s->pp_index[k]] = s->pp_signal[k * s->pres_length + offset];
+    }
+}
+
 void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
     if (n_threads == 0) acfdtd_set_threads(0);
 
@@ -667,6 +705,7 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
         const int64_t absolute = step_offset + step;
 
         dispatch(s, velocity_sweep_2d, s->nx);
+        if (s->n_pres_velocity) apply_prescribed_velocity_2d(s, absolute);
         if (s->has_rigid) dispatch(s, mask_velocity_sweep_2d, s->nx);
 
         if (s->n_wall) gather_walls_2d(s);
@@ -679,6 +718,7 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
                 s->p[s->source_index[source]] +=
                     s->src_coef * s->source_signal[source * s->source_length + absolute];
 
+        if (s->n_pres_pressure) apply_prescribed_pressure_2d(s, absolute);
         if (s->has_rigid) dispatch(s, zero_pressure_sweep_2d, s->nx);
 
         for (int64_t receiver = 0; receiver < s->n_receivers; receiver++)
