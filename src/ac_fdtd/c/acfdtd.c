@@ -208,11 +208,14 @@ static void damp_pressure(const acfdtd *s, int32_t i_start, int32_t i_end) {
  * the largest single lever left.
  *
  * What it gives up is everything the first-order system made easy: the impedance wall, the
- * absorbing layer and the relaxation states would all need re-deriving as three-level
- * relations. This kernel exists to measure what that work would be worth, not to replace
- * anything, so it implements rigid walls only. A rigid wall is a mirrored ghost cell, which is
- * what clamping the neighbour offset to zero does below -- and it is exactly what falls out of
- * eliminating a wall face held at zero velocity. */
+ * absorbing layer and the relaxation states each need re-deriving as three-level relations. A
+ * rigid wall is a mirrored ghost cell, which is what clamping the neighbour offset to zero does
+ * below -- and it is exactly what falls out of eliminating a wall face held at zero velocity.
+ * The locally-reacting wall is the three-level relation of ac_fdtd.scalar.ScalarFDTD,
+ *
+ *     (1 + a) p^{n+1} = 2 p^n - (1 - a) p^{n-1} + (c dt / dx)^2 L_N(p^n),   a = (c dt / 2dx) xi,
+ *
+ * on the wall cells only, with a summed over the faces a corner or edge cell touches. */
 
 typedef struct {
     int32_t nx, ny, nz;
@@ -220,6 +223,15 @@ typedef struct {
     REAL lambda_squared; /* (c dt / dx)^2 */
     REAL *current;
     REAL *previous;
+
+    /* Locally-reacting walls. When n_wall is 0 the room is rigid and the fast sweep runs; any wall
+     * at all switches to the exact sweep below. wall_a is a = c dt xi / (2 dx), already summed at
+     * edges and corners; wall_scratch holds p^{n-1} at the wall cells, saved before the sweep
+     * overwrites `previous`. */
+    int64_t n_wall;
+    const int64_t *wall_index;
+    const REAL *wall_a;
+    REAL *wall_scratch;
 } acfdtd_scalar;
 
 size_t acfdtd_scalar_struct_size(void) { return sizeof(acfdtd_scalar); }
@@ -264,6 +276,69 @@ static void scalar_sweep(const acfdtd_scalar *s, int32_t i_start, int32_t i_end)
     }
 }
 
+/* The exact path: the reference's arithmetic, operation for operation.
+ *
+ * The fast sweep above sums the six neighbours and subtracts 6 p; that is the same Laplacian
+ * algebraically but about 2e-14 away from ScalarFDTD, which builds it as one flux per face, added
+ * to the cell below and subtracted from the cell above, axis by axis. With walls the contract is
+ * bit-identity with the reference, so this sweep and the wall pass both go through
+ * neumann_laplacian, which reproduces that order exactly: per axis in x, y, z order,
+ * `+= (upper - here)` if an upper neighbour exists, then `-= (here - lower)` if a lower one does. */
+static inline REAL neumann_laplacian(const acfdtd_scalar *s, const REAL *cur, int32_t i, int32_t j,
+                                     int32_t k) {
+    const int64_t stride_x = (int64_t)s->ny * s->nz;
+    const int64_t stride_y = s->nz;
+    const REAL here = cur[0];
+    REAL lap = 0;
+    if (i < s->nx - 1) lap += cur[stride_x] - here;
+    if (i > 0) lap -= here - cur[-stride_x];
+    if (j < s->ny - 1) lap += cur[stride_y] - here;
+    if (j > 0) lap -= here - cur[-stride_y];
+    if (k < s->nz - 1) lap += cur[1] - here;
+    if (k > 0) lap -= here - cur[-1];
+    return lap;
+}
+
+/* Every cell gets the rigid update `(2 p - p_old) + lam^2 lap`, as the reference's first pass does;
+ * the wall pass then overwrites the wall cells. The x and y tests are per (i, j) and predictable;
+ * the compiler hoists them, so only the two z ends pay for a branch that changes. */
+static void scalar_sweep_exact(const acfdtd_scalar *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny, nz = s->nz;
+    const int64_t stride_x = (int64_t)ny * nz;
+    const REAL scale = s->lambda_squared;
+
+    for (int32_t i = i_start; i < i_end; i++) {
+        for (int32_t j = 0; j < ny; j++) {
+            const int64_t base = (int64_t)i * stride_x + (int64_t)j * nz;
+            const REAL *cur = s->current + base;
+            REAL *out = s->previous + base;
+            for (int32_t k = 0; k < nz; k++) {
+                const REAL lap = neumann_laplacian(s, cur + k, i, j, k);
+                out[k] = (2 * cur[k] - out[k]) + scale * lap;
+            }
+        }
+    }
+}
+
+/* The wall cells, after the sweep: `((2 p - (1 - a) p_old) + lam^2 lap) / (1 + a)`, in the
+ * reference's order. The Laplacian is recomputed from `current` (still p^n) rather than kept from
+ * the sweep: the wall is a surface, so this is cheap, and the sweep stays free of a per-cell test.
+ * p_old is the copy saved before the sweep, since `previous` now holds the rigid p^{n+1}. */
+static void finish_scalar_walls(const acfdtd_scalar *s) {
+    const int64_t stride_x = (int64_t)s->ny * s->nz;
+    const REAL scale = s->lambda_squared;
+    for (int64_t w = 0; w < s->n_wall; w++) {
+        const int64_t index = s->wall_index[w];
+        const int32_t i = (int32_t)(index / stride_x);
+        const int32_t j = (int32_t)((index % stride_x) / s->nz);
+        const int32_t k = (int32_t)(index % s->nz);
+        const REAL a = s->wall_a[w];
+        const REAL lap = neumann_laplacian(s, s->current + index, i, j, k);
+        s->previous[index] =
+            ((2 * s->current[index] - (1 - a) * s->wall_scratch[w]) + scale * lap) / (1 + a);
+    }
+}
+
 /* ------------------------------------------------------------------- the thread pool --- */
 
 /* One pool, shared by every kernel. A sweep is a function plus the range of planes to run it
@@ -297,6 +372,10 @@ static void damping_sweep(const void *state, int32_t start, int32_t end) {
 
 static void wave_sweep(const void *state, int32_t start, int32_t end) {
     scalar_sweep((const acfdtd_scalar *)state, start, end);
+}
+
+static void exact_wave_sweep(const void *state, int32_t start, int32_t end) {
+    scalar_sweep_exact((const acfdtd_scalar *)state, start, end);
 }
 
 /* An equal share of the slowest axis each, so every thread owns one contiguous block of
@@ -470,7 +549,15 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
     if (n_threads == 0) acfdtd_set_threads(0);
 
     for (int64_t step = 0; step < s->n_steps; step++) {
-        dispatch(s, wave_sweep, s->nx);
+        if (s->n_wall) {
+            /* Save p^{n-1} at the wall cells before the sweep overwrites `previous`. */
+            for (int64_t w = 0; w < s->n_wall; w++)
+                s->wall_scratch[w] = s->previous[s->wall_index[w]];
+            dispatch(s, exact_wave_sweep, s->nx);
+            finish_scalar_walls(s);
+        } else {
+            dispatch(s, wave_sweep, s->nx);
+        }
         REAL *swap = s->current;
         s->current = s->previous;
         s->previous = swap;
@@ -745,6 +832,8 @@ typedef struct {
     int64_t source_length;
     REAL lambda_squared; /* (c dt / dx)^2 */
     REAL src_coef;       /* rho c^2 dt */
+    REAL vel_coef;       /* dt / (rho dx): the momentum step of a driven face */
+    REAL pres_coef;      /* rho c^2 dt / dx: what one face flux does to a cell */
 
     REAL *current;
     REAL *previous; /* the oldest level, overwritten with the newest; pointers swap each step */
@@ -766,45 +855,71 @@ typedef struct {
 
     const int64_t *receiver_index;
     REAL *recording; /* n_receivers rows of n_steps */
+
+    /* Driven velocity faces and prescribed windows, as ac_fdtd.scalar2d keeps them. A face is the
+     * lower face of one cell: face_lower is -1 on a wall line. face_value holds v^{n-1/2} per face
+     * and is read on entry and written every step; face_drive / face_driven are per-step scratch.
+     * A window is either a velocity window (kind 0, target = face) or a pressure window (kind 1,
+     * target = flat cell); window values live in window_pool at window_offset. Windows are listed
+     * in insertion order, which is the order the later-added-wins rule needs. */
+    int64_t n_faces;
+    const int64_t *face_cell;
+    const int64_t *face_lower;
+    const REAL *face_a_cell;  /* wall coefficient of the cell, 0 off the wall ring */
+    const REAL *face_a_lower; /* wall coefficient of the cell below, 0 when there is none */
+    const int32_t *face_closed;
+    REAL *face_value;
+    REAL *face_drive;
+    int32_t *face_driven;
+
+    int64_t n_windows;
+    const int32_t *window_kind;
+    const int64_t *window_target;
+    const int64_t *window_start;
+    const int64_t *window_length;
+    const int64_t *window_offset;
+    const REAL *window_pool;
 } acfdtd2d_scalar;
 
 size_t acfdtd2d_scalar_struct_size(void) { return sizeof(acfdtd2d_scalar); }
+
+/* The discrete Laplacian of ac_fdtd.scalar2d._laplacian at one cell, accumulated in the same
+ * order as the NumPy code: the x-face flux on the upper side, then the lower side, then the same
+ * on y. Each term is the face flux times its open-face mask when obstacles exist. The order is
+ * part of the contract (the compiled kernel is checked bit for bit against the NumPy reference),
+ * because a different summation of the same terms rounds differently. */
+static inline REAL laplacian_2d(const acfdtd2d_scalar *s, int32_t i, int32_t j) {
+    const int32_t nx = s->nx, ny = s->ny;
+    const int64_t c = (int64_t)i * ny + j;
+    const REAL *cur = s->current;
+    const REAL here = cur[c];
+    REAL lap = 0;
+    if (!s->has_rigid) {
+        if (i < nx - 1) lap += cur[c + ny] - here;
+        if (i > 0) lap -= here - cur[c - ny];
+        if (j < ny - 1) lap += cur[c + 1] - here;
+        if (j > 0) lap -= here - cur[c - 1];
+    } else {
+        if (i < nx - 1) lap += s->x_open[c] * (cur[c + ny] - here);
+        if (i > 0) lap -= s->x_open[c - ny] * (here - cur[c - ny]);
+        if (j < ny - 1) lap += s->y_open[(int64_t)i * (ny - 1) + j] * (cur[c + 1] - here);
+        if (j > 0) lap -= s->y_open[(int64_t)i * (ny - 1) + j - 1] * (here - cur[c - 1]);
+    }
+    return lap;
+}
 
 /* One sweep writes the new level into `previous` from `current` (p^n) and `previous` (p^{n-1}).
  * The y axis is contiguous. The rigid-wall Neumann condition is the boundary test on each face
  * contributing nothing off the grid; obstacles close individual interior faces via the masks. */
 static void scalar_sweep_2d(const acfdtd2d_scalar *s, int32_t i_start, int32_t i_end) {
-    const int32_t nx = s->nx, ny = s->ny;
     const REAL scale = s->lambda_squared;
 
     for (int32_t i = i_start; i < i_end; i++) {
-        const int64_t row = (int64_t)i * ny;
+        const int64_t row = (int64_t)i * s->ny;
         const REAL *cur = s->current + row;
         REAL *out = s->previous + row;
-        const REAL *cur_lo = cur - ny; /* row i-1 */
-        const REAL *cur_hi = cur + ny; /* row i+1 */
-
-        if (!s->has_rigid) {
-            for (int32_t j = 0; j < ny; j++) {
-                REAL lap = 0;
-                if (i > 0) lap += cur_lo[j] - cur[j];
-                if (i < nx - 1) lap += cur_hi[j] - cur[j];
-                if (j > 0) lap += cur[j - 1] - cur[j];
-                if (j < ny - 1) lap += cur[j + 1] - cur[j];
-                out[j] = 2 * cur[j] - out[j] + scale * lap;
-            }
-        } else {
-            const REAL *xo_lo = s->x_open + (int64_t)(i - 1) * ny; /* face (i-1,i) */
-            const REAL *xo_hi = s->x_open + row;                   /* face (i,i+1) */
-            const REAL *yo = s->y_open + (int64_t)i * (ny - 1);    /* faces (j,j+1) */
-            for (int32_t j = 0; j < ny; j++) {
-                REAL lap = 0;
-                if (i > 0) lap += xo_lo[j] * (cur_lo[j] - cur[j]);
-                if (i < nx - 1) lap += xo_hi[j] * (cur_hi[j] - cur[j]);
-                if (j > 0) lap += yo[j - 1] * (cur[j - 1] - cur[j]);
-                if (j < ny - 1) lap += yo[j] * (cur[j + 1] - cur[j]);
-                out[j] = 2 * cur[j] - out[j] + scale * lap;
-            }
+        for (int32_t j = 0; j < s->ny; j++) {
+            out[j] = 2 * cur[j] - out[j] + scale * laplacian_2d(s, i, j);
         }
     }
 }
@@ -825,6 +940,71 @@ static void zero_scalar_pressure_dispatch_2d(const void *state, int32_t start, i
     zero_rigid_pressure_scalar_2d((const acfdtd2d_scalar *)state, start, end);
 }
 
+/* Three-level wall post-pass, as ac_fdtd.scalar2d._apply_impedance_walls:
+ * (1 + a) p^{n+1} = 2 p^n - (1 - a) p^{n-1} + lam^2 L_N(p^n), evaluated at the wall cells from
+ * the same Laplacian the sweep used (recomputed here, not read back, so the sweep's values at
+ * these cells are simply overwritten). */
+static void finish_scalar_walls_2d(acfdtd2d_scalar *s) {
+    const REAL scale = s->lambda_squared;
+    for (int64_t w = 0; w < s->n_wall; w++) {
+        const int64_t index = s->wall_index[w];
+        const int32_t i = (int32_t)(index / s->ny);
+        const int32_t j = (int32_t)(index % s->ny);
+        const REAL a = s->wall_a[w];
+        const REAL here = s->current[index];
+        const REAL before = s->wall_scratch[w];
+        s->previous[index] =
+            (2 * here - (1 - a) * before + scale * laplacian_2d(s, i, j)) / (1 + a);
+    }
+}
+
+/* Driven velocity faces, as ac_fdtd.scalar2d._update_velocity_faces. Runs after the wall pass
+ * and before the volume sources, and reads only `current` (p^n) while it adds to `previous`
+ * (p^{n+1}), so the order among faces is the only order that matters: insertion order. */
+static void update_velocity_faces_2d(acfdtd2d_scalar *s, int64_t absolute) {
+    for (int64_t f = 0; f < s->n_faces; f++) s->face_driven[f] = 0;
+    /* A window that is active overwrites its face's drive; the last one in insertion order wins. */
+    for (int64_t w = 0; w < s->n_windows; w++) {
+        if (s->window_kind[w] != 0) continue;
+        const int64_t offset = absolute - s->window_start[w];
+        if (offset < 0 || offset >= s->window_length[w]) continue;
+        const int64_t f = s->window_target[w];
+        s->face_drive[f] = s->window_pool[s->window_offset[w] + offset];
+        s->face_driven[f] = 1;
+    }
+
+    const REAL *cur = s->current;
+    REAL *out = s->previous;
+    for (int64_t f = 0; f < s->n_faces; f++) {
+        REAL *value = s->face_value + f;
+        if (s->face_closed[f]) {
+            *value = 0; /* a rigid obstacle touches the face: silent, held at zero */
+            continue;
+        }
+        const int64_t c = s->face_cell[f];
+        const int64_t l = s->face_lower[f];
+        const REAL free_value = (l >= 0) ? *value - s->vel_coef * (cur[c] - cur[l]) : *value;
+        const REAL new_value = s->face_driven[f] ? s->face_drive[f] : free_value;
+        const REAL delta = new_value - free_value;
+        *value = new_value;
+
+        const REAL amount = s->pres_coef * delta;
+        out[c] += amount / (1 + s->face_a_cell[f]);
+        if (l >= 0) out[l] -= amount / (1 + s->face_a_lower[f]);
+    }
+}
+
+/* Prescribed pressure windows, as ac_fdtd.scalar2d._apply_prescribed_pressure: after the volume
+ * sources, in insertion order, the node is set to the sample while its window is active. */
+static void apply_prescribed_pressure_scalar_2d(acfdtd2d_scalar *s, int64_t absolute) {
+    for (int64_t w = 0; w < s->n_windows; w++) {
+        if (s->window_kind[w] != 1) continue;
+        const int64_t offset = absolute - s->window_start[w];
+        if (offset < 0 || offset >= s->window_length[w]) continue;
+        s->previous[s->window_target[w]] = s->window_pool[s->window_offset[w] + offset];
+    }
+}
+
 void acfdtd2d_scalar_run(acfdtd2d_scalar *s, int64_t step_offset) {
     if (n_threads == 0) acfdtd_set_threads(0);
 
@@ -835,24 +1015,23 @@ void acfdtd2d_scalar_run(acfdtd2d_scalar *s, int64_t step_offset) {
         for (int64_t w = 0; w < s->n_wall; w++) s->wall_scratch[w] = s->previous[s->wall_index[w]];
 
         dispatch(s, scalar_sweep_2d_dispatch, s->nx);
-
-        /* Three-level wall post-pass: out_wall = (out_rigid + a p^{n-1}) / (1 + a). */
-        for (int64_t w = 0; w < s->n_wall; w++) {
-            const int64_t index = s->wall_index[w];
-            const REAL a = s->wall_a[w];
-            s->previous[index] = (s->previous[index] + a * s->wall_scratch[w]) / (1 + a);
-        }
+        finish_scalar_walls_2d(s);
+        update_velocity_faces_2d(s, absolute);
 
         /* Soft volume sources: the DIFFERENCE S_n - S_{n-1} (the eliminated divergence carries the
-         * previous sample). Written into the new level, matching the reference's order. */
+         * previous sample). Written into the new level, matching the reference's order. The rows
+         * are zero-padded past their own length, so the sample before the window's end is read
+         * at absolute == source_length too, exactly as the NumPy code does. */
         for (int64_t src = 0; src < s->n_sources; src++) {
-            if (absolute < s->source_length) {
+            if (absolute <= s->source_length) {
                 const REAL *sig = s->source_signal + src * s->source_length;
-                const REAL now = sig[absolute];
+                const REAL now = (absolute < s->source_length) ? sig[absolute] : (REAL)0;
                 const REAL prev = (absolute > 0) ? sig[absolute - 1] : (REAL)0;
-                s->previous[s->source_index[src]] += s->src_coef * (now - prev);
+                const REAL delta = now - prev;
+                if (delta != 0) s->previous[s->source_index[src]] += s->src_coef * delta;
             }
         }
+        apply_prescribed_pressure_scalar_2d(s, absolute);
 
         if (s->has_rigid) dispatch(s, zero_scalar_pressure_dispatch_2d, s->nx);
 

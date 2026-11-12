@@ -20,8 +20,11 @@ derivations are exact and not merely close.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
+from .air import AirAbsorption
 from .boundaries import WallAdmittances, wall_update_coefficients
 from .cpml import AbsorbingBoundary, cpml_axis_profiles_3d
 from .grid import Grid, max_stable_time_step
@@ -67,6 +70,10 @@ class ScalarFDTD:
         absorbing_boundary: A CFS-CPML region lining a subset of the walls (open field, or a tuned
             partial absorber). When present the scheme stores velocity only in the boundary shell;
             a closed room holds two cell arrays and nothing else.
+        air_absorption: Atmospheric absorption (ISO 9613-1) with the first-order scheme's semantics
+            and constants: one cell array per relaxation process, driven by a divergence rebuilt
+            from the two pressure levels (see :meth:`_relaxed_update`), so no velocity grid. Not
+            combinable with ``absorbing_boundary``: the CPML shell has no relaxation states.
     """
 
     def __init__(
@@ -78,9 +85,15 @@ class ScalarFDTD:
         walls: WallAdmittances | None = None,
         rigid_cells: np.ndarray | None = None,
         absorbing_boundary: AbsorbingBoundary | None = None,
+        air_absorption: AirAbsorption | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
+        if air_absorption is not None and absorbing_boundary is not None:
+            raise ValueError(
+                "air_absorption cannot be combined with absorbing_boundary: the CPML shell has no "
+                "relaxation states, so the absorption would silently stop at the shell"
+            )
 
         self.grid = grid
         self.medium = medium
@@ -115,6 +128,40 @@ class ScalarFDTD:
         self._cpml = absorbing_boundary is not None
         if absorbing_boundary is not None:
             self._setup_cpml(absorbing_boundary)
+
+        # Air absorption: the first-order scheme's relaxation states, one cell array per process,
+        # with the same constants (decay, dt * mean weight, gain), cast the same way. The scheme
+        # stays pressure-only: the divergence that drives the states is reconstructed each step
+        # from (p^n, p^{n-1}) and the previous step's offset instead of being stored.
+        self.air_absorption = air_absorption
+        self._relaxation: list[tuple[np.ndarray, np.floating, np.floating, np.floating]] = []
+        if air_absorption is not None:
+            processes = air_absorption.processes(medium.sound_speed, self.dt)
+            relaxed_speed_squared = medium.sound_speed**2 / (
+                1.0 + sum(process.strength for process in processes)
+            )
+            for process in processes:
+                decay = math.exp(-self.dt / process.relaxation_time)
+                mean_weight = (process.relaxation_time / self.dt) * (1.0 - decay)
+                gain = medium.density * relaxed_speed_squared * process.strength / grid.dx
+                self._relaxation.append(
+                    (
+                        np.zeros(grid.shape, dtype=self.dtype),
+                        self.dtype.type(decay),
+                        self.dtype.type(self.dt * mean_weight),
+                        self.dtype.type(gain),
+                    )
+                )
+        # p* = p^n + R^n - alpha D^{n+1/2} is the first-order pressure update with the relaxation
+        # folded in: its own rho c^2 dt / dx plus, per process, gain * (dt * mean weight - dt).
+        dt = self.dtype.type(self.dt)
+        self._pressure_coefficient = self.dtype.type(
+            medium.density * medium.sound_speed**2 * self.dt / grid.dx
+        )
+        self._relaxed_coefficient = self._pressure_coefficient + sum(
+            (gain * (weight - dt) for _, _, weight, gain in self._relaxation), self.dtype.type(0.0)
+        )
+        self._momentum_coefficient = self.dtype.type(self.dt / (medium.density * grid.dx))
 
         self._sources: list[tuple[tuple[int, ...], np.ndarray]] = []
         self._receivers: list[tuple[tuple[int, ...], list[float]]] = []
@@ -304,12 +351,14 @@ class ScalarFDTD:
         self._record_velocity(p)
 
         lap = self._laplacian(p)
-        p_new = 2.0 * p - self.p_old + self._lambda_squared * lap
-        self._apply_impedance_walls(p_new, p, lap)
-        if self._cpml:
-            self._apply_cpml(p, p_new)
-
-        self._inject_sources(p_new)
+        if self._relaxation:
+            p_new = self._relaxed_update(p, lap)
+        else:
+            p_new = 2.0 * p - self.p_old + self._lambda_squared * lap
+            self._apply_impedance_walls(p_new, p, lap)
+            if self._cpml:
+                self._apply_cpml(p, p_new)
+            self._inject_sources(p_new)
         self._apply_prescribed_pressure(p_new)
         if self._rigid_cells is not None:
             p_new[self._rigid_cells] = 0.0
@@ -323,6 +372,77 @@ class ScalarFDTD:
     def run(self, n_steps: int) -> None:
         for _ in range(n_steps):
             self.step()
+
+    def _relaxation_sum(self) -> np.ndarray:
+        """``R = sum_k (dt * mean weight)_k psi_k``: the pressure offset the states contribute."""
+        offset = np.zeros_like(self.p)
+        for state, _, weight, _ in self._relaxation:
+            offset += weight * state
+        return offset
+
+    def _relaxed_update(self, p: np.ndarray, lap: np.ndarray) -> np.ndarray:
+        """``p^{n+1}`` with air relaxation, holding the states one step behind (``psi^{n-1}``).
+
+        The first-order step is, with ``D`` the unscaled divergence sum it feeds the states,
+        ``R^n = sum_k m_k psi_k^n`` and ``s^n`` the source increment added after the wall solve:
+
+            (1 + a) (p^{n+1} - s^n) = p^n + R^n - alpha D^{n+1/2} - a p^n
+            psi_k^{n+1} = d_k (psi_k^n - g_k D^{n+1/2}) + g_k D^{n+1/2}
+            D^{n+1/2} = D^{n-1/2} - (dt / (rho dx)) L(p^n)
+
+        So the previous step's own relation, solved for ``D^{n-1/2}``, rebuilds it from the two
+        pressure levels and ``R^{n-1}``; that is why the states lag one step: ``psi^{n-1}`` is
+        exactly what the rebuild needs, and it is then advanced to ``psi^n`` before use. Exact in
+        exact arithmetic; the operations are reordered relative to the first-order scheme, so it
+        agrees to round-off, not to the bit. Solid cells have all faces closed: ``L = 0`` and
+        ``p = 0`` there, so their divergence and states stay zero. A prescribed pressure node
+        breaks the previous step's relation, so it is not supported together with air.
+        """
+        alpha = self._relaxed_coefficient
+        step = self.step_index
+        if step == 0:
+            # Nothing to rebuild yet: the states already hold psi^0 = 0, and D^{-1/2} is the
+            # start's own divergence, which set_initial_state encodes as p^{-1} = p^0 + K D
+            # (zero for a start at rest).
+            divergence = (self.p_old - p) / self._pressure_coefficient
+        else:
+            # Undo the previous step's source increment and its wall solve, then divide alpha out.
+            unsourced = p.copy()
+            for index, signal in self._sources:
+                if step - 1 < len(signal):
+                    unsourced[index] -= self._source_coefficient * signal[step - 1]
+            previous_offset = self._relaxation_sum()
+            divergence = self.p_old + previous_offset - unsourced
+            if self._wall_indices.size:
+                idx = self._wall_indices
+                a = self._wall_a
+                flat = divergence.reshape(-1)
+                flat[idx] = (
+                    (1.0 - a) * self.p_old.reshape(-1)[idx]
+                    + previous_offset.reshape(-1)[idx]
+                    - (1.0 + a) * unsourced.reshape(-1)[idx]
+                )
+            divergence /= alpha
+            # psi^{n-1} -> psi^n, in the first-order scheme's exact exponential form.
+            for state, decay, _, gain in self._relaxation:
+                target = gain * divergence
+                np.subtract(state, target, out=state)
+                state *= decay
+                state += target
+
+        # The eliminated momentum step, then the first-order pressure update and wall solve.
+        divergence -= self._momentum_coefficient * lap
+        p_new = p + self._relaxation_sum() - alpha * divergence
+        if self._wall_indices.size:
+            idx = self._wall_indices
+            a = self._wall_a
+            flat_new = p_new.reshape(-1)
+            flat_new[idx] = (flat_new[idx] - a * p.reshape(-1)[idx]) / (1.0 + a)
+        # The full sample, not the difference: the divergence above carries no source.
+        for index, signal in self._sources:
+            if step < len(signal):
+                p_new[index] += self._source_coefficient * signal[step]
+        return p_new
 
     def _inject_sources(self, p_new: np.ndarray) -> None:
         step = self.step_index

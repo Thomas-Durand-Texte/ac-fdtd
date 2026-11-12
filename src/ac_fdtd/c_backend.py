@@ -246,6 +246,10 @@ def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
             ("lambda_squared", real),
             ("current", ctypes.POINTER(real)),
             ("previous", ctypes.POINTER(real)),
+            ("n_wall", ctypes.c_int64),
+            ("wall_index", ctypes.POINTER(ctypes.c_int64)),
+            ("wall_a", ctypes.POINTER(real)),
+            ("wall_scratch", ctypes.POINTER(real)),
         ]
 
     return ScalarState
@@ -255,6 +259,7 @@ def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
     real = ctypes.c_double if dtype == np.float64 else ctypes.c_float
     pointer = ctypes.POINTER(real)
     index_pointer = ctypes.POINTER(ctypes.c_int64)
+    int32_pointer = ctypes.POINTER(ctypes.c_int32)
 
     class ScalarState2D(ctypes.Structure):
         _fields_ = [
@@ -267,6 +272,8 @@ def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
             ("source_length", ctypes.c_int64),
             ("lambda_squared", real),
             ("src_coef", real),
+            ("vel_coef", real),
+            ("pres_coef", real),
             ("current", pointer),
             ("previous", pointer),
             ("x_open", pointer),
@@ -280,6 +287,22 @@ def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
             ("source_signal", pointer),
             ("receiver_index", index_pointer),
             ("recording", pointer),
+            ("n_faces", ctypes.c_int64),
+            ("face_cell", index_pointer),
+            ("face_lower", index_pointer),
+            ("face_a_cell", pointer),
+            ("face_a_lower", pointer),
+            ("face_closed", int32_pointer),
+            ("face_value", pointer),
+            ("face_drive", pointer),
+            ("face_driven", int32_pointer),
+            ("n_windows", ctypes.c_int64),
+            ("window_kind", int32_pointer),
+            ("window_target", index_pointer),
+            ("window_start", index_pointer),
+            ("window_length", index_pointer),
+            ("window_offset", index_pointer),
+            ("window_pool", pointer),
         ]
 
     return ScalarState2D
@@ -820,9 +843,10 @@ class CScalarFDTD:
     pressure-velocity run started from ``v^{-1/2} = 0`` to the last bit, which is what
     ``tests/test_scalar_variant.py`` checks.
 
-    **Rigid walls only.** The impedance wall, the absorbing layer and the relaxation states are
-    all natural in a first-order system and would each need re-deriving as a three-level
-    relation here. This exists to measure what that work would be worth before doing it.
+    Rigid and locally-reacting walls (``walls``, as in :class:`~ac_fdtd.scalar.ScalarFDTD`). With
+    any absorbing wall the kernel evaluates the reference's arithmetic in the reference's order, so
+    it is bit-identical to ``ScalarFDTD`` in fp64; the all-rigid room keeps a faster sweep that
+    agrees to round-off. The absorbing layer and the relaxation states are not compiled here.
     """
 
     def __init__(
@@ -831,6 +855,7 @@ class CScalarFDTD:
         medium: Medium = AIR,
         courant: float = 1.0,
         dtype: np.dtype = np.float64,
+        walls: WallAdmittances | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -838,6 +863,7 @@ class CScalarFDTD:
         self.grid = grid
         self.medium = medium
         self.courant = courant
+        self.walls = walls or WallAdmittances()
         self.dtype = np.dtype(dtype)
         self.dt = courant * max_stable_time_step(grid.dx, medium.sound_speed)
         self.step_index = 0
@@ -855,6 +881,16 @@ class CScalarFDTD:
         #: step, so after an odd number of steps the roles have changed places.
         self._newest = 0
 
+        # The reference casts lam^2 and a to the working precision before using them; doing the
+        # same here is part of being bit-identical (and of matching it in fp32).
+        self._lambda_squared = self.dtype.type((medium.sound_speed * self.dt / grid.dx) ** 2)
+        # Rigid faces contribute nothing, so an all-rigid room has no wall cells and the C side
+        # takes its fast rigid sweep; any absorbing face selects the exact one.
+        indices, coefficient = wall_update_coefficients(grid, medium, self.dt, self.walls)
+        self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
+        self._wall_a = coefficient.astype(self.dtype)
+        self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
+
     @property
     def p(self) -> np.ndarray:
         """The newest pressure level."""
@@ -864,6 +900,10 @@ class CScalarFDTD:
     def previous(self) -> np.ndarray:
         """The level before it. Equal to :attr:`p` at rest, which is the state ``v = 0``."""
         return self._buffers[1 - self._newest]
+
+    def set_threads(self, count: int) -> int:
+        """Use ``count`` threads (``0``: the default for this machine); returns the count set."""
+        return int(self._library.acfdtd_set_threads(int(count)))
 
     def set_initial_pressure(self, field: np.ndarray) -> None:
         """Start from a given pressure at rest — both levels equal, so the velocity is zero."""
@@ -883,9 +923,13 @@ class CScalarFDTD:
             ny=self.grid.ny,
             nz=self.grid.nz,
             n_steps=n_steps,
-            lambda_squared=(self.medium.sound_speed * self.dt / self.grid.dx) ** 2,
+            lambda_squared=self._lambda_squared,
             current=self.p.ctypes.data_as(ctypes.POINTER(real)),
             previous=self.previous.ctypes.data_as(ctypes.POINTER(real)),
+            n_wall=self._wall_index.size,
+            wall_index=self._wall_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            wall_a=self._wall_a.ctypes.data_as(ctypes.POINTER(real)),
+            wall_scratch=self._wall_scratch.ctypes.data_as(ctypes.POINTER(real)),
         )
         self._library.acfdtd_scalar_run(ctypes.byref(state))
         self.step_index += n_steps
@@ -898,9 +942,9 @@ class CScalarFDTD2D:
     Two cell arrays instead of three, one sweep instead of two: the fast, low-memory path for a
     closed 2D room. It is the same scheme as :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`, not an
     approximation — bit-identical to :class:`~ac_fdtd.scalar2d.ScalarFDTD2D` — with rigid and
-    locally-reacting walls, rigid obstacles, soft volume sources and pressure receivers. Open
-    boundaries (the CFS-CPML shell) and the matched layer are not compiled here yet; the NumPy
-    reference carries those.
+    locally-reacting walls, rigid obstacles, soft volume sources, prescribed pressure and velocity
+    sources, and pressure receivers. Open boundaries (the CFS-CPML shell), the matched layer and
+    velocity receivers are not compiled here yet; the NumPy reference carries those.
 
     As with the other compiled kernels :meth:`run` is the unit of work, and the two pressure levels
     are ordinary NumPy arrays C writes into.
@@ -937,6 +981,10 @@ class CScalarFDTD2D:
 
         self._lambda_squared = (medium.sound_speed * self.dt / grid.dx) ** 2
         self._src_coef = medium.density * medium.sound_speed**2 * self.dt
+        # The two face constants, computed as ac_fdtd.scalar2d.ScalarFDTD2D computes them so the
+        # kernel multiplies the same rounded numbers.
+        self._pres_coef = medium.density * medium.sound_speed**2 * self.dt / grid.dx
+        self._vel_coef = self.dt / (medium.density * grid.dx)
 
         self._buffers = [
             np.zeros(grid.shape, dtype=self.dtype),
@@ -950,6 +998,7 @@ class CScalarFDTD2D:
         self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
 
         self._has_rigid = rigid_cells is not None
+        self._rigid: np.ndarray | None = None
         if rigid_cells is None:
             self._x_open = np.ones(1, dtype=self.dtype)
             self._y_open = np.ones(1, dtype=self.dtype)
@@ -960,6 +1009,7 @@ class CScalarFDTD2D:
                 raise ValueError(
                     f"rigid_cells shape {rigid.shape} does not match the grid {grid.shape}"
                 )
+            self._rigid = rigid
             self._x_open = np.ascontiguousarray(
                 (~(rigid[:-1, :] | rigid[1:, :])).astype(self.dtype).reshape(-1)
             )
@@ -971,6 +1021,19 @@ class CScalarFDTD2D:
         self._sources: list[tuple[tuple[int, int], np.ndarray]] = []
         self._receivers: list[tuple[int, int]] = []
         self._recordings: list[np.ndarray] = []
+
+        # Prescribed sources, in insertion order: (kind, target, start, samples). kind 0 drives a
+        # face (target = face index), kind 1 holds a pressure node (target = flat cell index).
+        self._windows: list[tuple[int, int, int, np.ndarray]] = []
+        # Driven faces, one entry per (axis, cell), in creation order. The stored velocity values
+        # persist across run calls; the rest is fixed geometry, fixed when the face is created.
+        self._face_index: dict[tuple[int, tuple[int, int]], int] = {}
+        self._face_cells: list[int] = []
+        self._face_lowers: list[int] = []
+        self._face_a_cells: list[float] = []
+        self._face_a_lowers: list[float] = []
+        self._face_closed: list[int] = []
+        self._face_value = np.zeros(0, dtype=self.dtype)
 
     @property
     def p(self) -> np.ndarray:
@@ -1003,6 +1066,79 @@ class CScalarFDTD2D:
 
     def add_volume_source(self, point: tuple[float, float], signal: np.ndarray) -> None:
         self._sources.append((self.grid.cell_index(point), np.asarray(signal, dtype=self.dtype)))
+
+    def add_prescribed_source(
+        self,
+        point: tuple[float, float],
+        signal: np.ndarray,
+        start: int = 0,
+        kind: str = "pressure",
+        axis: int | None = None,
+    ) -> None:
+        """The contract of :meth:`ac_fdtd.scalar2d.ScalarFDTD2D.add_prescribed_source`, compiled.
+
+        A pressure source holds the cell at ``signal``; a velocity source drives the lower face of
+        the cell containing ``point`` along ``axis``. The stored face values and the windows are
+        carried across :meth:`run` calls, so a run can be split anywhere.
+        """
+        if start < 0:
+            raise ValueError(f"start must be non-negative, got {start}")
+        samples = np.asarray(signal, dtype=self.dtype)
+        cell = self.grid.cell_index(point)
+        if kind == "pressure":
+            if axis is not None:
+                raise ValueError("axis is meaningless for a pressure source; leave it None")
+            self._windows.append((1, cell[0] * self.grid.ny + cell[1], start, samples))
+        elif kind == "velocity":
+            if axis not in (0, 1):
+                raise ValueError(f"velocity source needs axis in (0, 1), got {axis!r}")
+            self._windows.append((0, self._face(axis, cell), start, samples))
+        else:
+            raise ValueError(f"kind must be 'pressure' or 'velocity', got {kind!r}")
+
+    def _face(self, axis: int, cell: tuple[int, int]) -> int:
+        """The index of the driven face on the lower side of ``cell``, created at rest on first use.
+
+        The geometry is decided here, once: the flat index of the cell and of the one below it, the
+        wall coefficients of both (zero off the wall ring, read from the same table the walls use),
+        and whether a rigid obstacle closes the face. Mirrors ``ScalarFDTD2D._velocity_face``.
+        """
+        key = (axis, cell)
+        existing = self._face_index.get(key)
+        if existing is not None:
+            return existing
+        if self.step_index > 0:
+            # As in ScalarFDTD2D: a new face starts at v = 0, which is only true from rest.
+            raise ValueError("a velocity source on a new face must be added before the first step")
+
+        ny = self.grid.ny
+        flat = cell[0] * ny + cell[1]
+        if cell[axis] > 0:
+            below = list(cell)
+            below[axis] -= 1
+            lower = below[0] * ny + below[1]
+            a_lower = self._wall_coefficient(lower)
+            closed = self._rigid is not None and bool(
+                self._rigid[cell] or self._rigid[below[0], below[1]]
+            )
+        else:
+            lower = -1
+            a_lower = 0.0
+            closed = False
+
+        index = len(self._face_cells)
+        self._face_index[key] = index
+        self._face_cells.append(flat)
+        self._face_lowers.append(lower)
+        self._face_a_cells.append(float(self._wall_coefficient(flat)))
+        self._face_a_lowers.append(float(a_lower))
+        self._face_closed.append(int(closed))
+        self._face_value = np.append(self._face_value, self.dtype.type(0.0))
+        return index
+
+    def _wall_coefficient(self, flat: int) -> float:
+        hits = np.flatnonzero(self._wall_index == flat)
+        return float(self._wall_a[hits[0]]) if hits.size else 0.0
 
     def add_pressure_receiver(self, point: tuple[float, float]) -> int:
         index = self.grid.cell_index(point)
@@ -1038,6 +1174,32 @@ class CScalarFDTD2D:
         recording = np.zeros((len(self._receivers), n_steps), dtype=self.dtype)
 
         source_signal = np.ascontiguousarray(source_signal)
+
+        # Prescribed windows, flattened: their samples are concatenated into one pool, and each
+        # window records where its own run starts in that pool.
+        n_windows = len(self._windows)
+        window_kind = np.array([w[0] for w in self._windows], dtype=np.int32)
+        window_target = np.array([w[1] for w in self._windows], dtype=np.int64)
+        window_start = np.array([w[2] for w in self._windows], dtype=np.int64)
+        window_length = np.array([w[3].size for w in self._windows], dtype=np.int64)
+        window_offset = np.zeros(n_windows, dtype=np.int64)
+        if n_windows:
+            window_offset[1:] = np.cumsum(window_length)[:-1]
+        window_pool = np.ascontiguousarray(
+            np.concatenate([w[3] for w in self._windows] or [np.zeros(0, dtype=self.dtype)]),
+            dtype=self.dtype,
+        )
+
+        n_faces = len(self._face_cells)
+        face_cell = np.array(self._face_cells, dtype=np.int64)
+        face_lower = np.array(self._face_lowers, dtype=np.int64)
+        face_a_cell = np.array(self._face_a_cells, dtype=self.dtype)
+        face_a_lower = np.array(self._face_a_lowers, dtype=self.dtype)
+        face_closed = np.array(self._face_closed, dtype=np.int32)
+        face_value = np.ascontiguousarray(self._face_value, dtype=self.dtype)
+        face_drive = np.zeros(n_faces, dtype=self.dtype)
+        face_driven = np.zeros(n_faces, dtype=np.int32)
+
         state = self._state_type(
             nx=self.grid.nx,
             ny=self.grid.ny,
@@ -1048,6 +1210,8 @@ class CScalarFDTD2D:
             source_length=length,
             lambda_squared=self.dtype.type(self._lambda_squared),
             src_coef=self.dtype.type(self._src_coef),
+            vel_coef=self.dtype.type(self._vel_coef),
+            pres_coef=self.dtype.type(self._pres_coef),
             current=self.p.ctypes.data_as(ctypes.POINTER(real)),
             previous=self.previous.ctypes.data_as(ctypes.POINTER(real)),
             x_open=self._x_open.ctypes.data_as(ctypes.POINTER(real)),
@@ -1061,8 +1225,25 @@ class CScalarFDTD2D:
             source_signal=source_signal.ctypes.data_as(ctypes.POINTER(real)),
             receiver_index=receiver_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             recording=recording.ctypes.data_as(ctypes.POINTER(real)),
+            n_faces=n_faces,
+            face_cell=face_cell.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            face_lower=face_lower.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            face_a_cell=face_a_cell.ctypes.data_as(ctypes.POINTER(real)),
+            face_a_lower=face_a_lower.ctypes.data_as(ctypes.POINTER(real)),
+            face_closed=face_closed.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            face_value=face_value.ctypes.data_as(ctypes.POINTER(real)),
+            face_drive=face_drive.ctypes.data_as(ctypes.POINTER(real)),
+            face_driven=face_driven.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            n_windows=n_windows,
+            window_kind=window_kind.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            window_target=window_target.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            window_start=window_start.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            window_length=window_length.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            window_offset=window_offset.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            window_pool=window_pool.ctypes.data_as(ctypes.POINTER(real)),
         )
         self._library.acfdtd2d_scalar_run(ctypes.byref(state), ctypes.c_int64(self.step_index))
+        self._face_value = face_value
         self.step_index += n_steps
         self._newest ^= n_steps & 1
         if self._receivers:

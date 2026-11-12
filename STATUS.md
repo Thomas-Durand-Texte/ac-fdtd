@@ -50,11 +50,15 @@ and when; this file is the current picture and gets rewritten.
    compiled speed-up was 2–3× in earlier benchmarks, the older "5×" optimistic), both carrying the
    **CFS-CPML open boundary** (−45 dB+ at all angles including corners, plus a tunable
    `partial_skin` that beats the locally-reacting wall). The **compiled 2D kernel `CScalarFDTD2D`**
-   (three-level walls + obstacles + volume sources + receivers) has landed too — bit-identical to
-   the reference, 1.8–2.5× the p–v C kernel. Still to do, in order: the **3D C kernel** (extend
-   `CScalarFDTD` with walls/obstacles) and the **CPML shell in C**; then adapter + auto-selection in
-   the app. Air relaxation ports too (reconstruct the divergence from the two pressure levels, +1
-   array/process); the matched sponge does not — the CPML is its pressure-only replacement.
+   (three-level walls + obstacles + volume sources + prescribed pressure/velocity sources (T007) +
+   receivers) has landed too — bit-identical to
+   the reference, 1.8–2.5× the p–v C kernel. The 3D `CScalarFDTD` now has the locally-reacting
+   walls too (T001, bit-identical to `ScalarFDTD`). Still to do, in order: the rest of the **3D C
+   kernel** (obstacles, sources/receivers) and the **CPML shell in C**; then adapter + auto-selection in
+   the app. Air relaxation has landed in both NumPy references (T006: divergence rebuilt from the
+   two pressure levels, +1 array/process, equal to the p–v scheme with air to ~1e-14; not yet with
+   the CPML shell or prescribed pressure sources, nor in C); the matched sponge does not port — the
+   CPML is its pressure-only replacement.
 
 2. **Fourth order in space.** A further **6.8× fewer cell-updates** for the same 1 % phase
    error. The design is settled and written down: build the gradient with whatever stencils the
