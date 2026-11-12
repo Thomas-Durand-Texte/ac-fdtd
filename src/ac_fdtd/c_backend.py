@@ -44,6 +44,7 @@ __all__ = [
     "CAcousticFDTD",
     "CAcousticFDTD2D",
     "CScalarFDTD",
+    "CScalarFDTD2D",
     "build",
     "build_report",
     "is_available",
@@ -107,6 +108,8 @@ def _library(dtype: np.dtype) -> ctypes.CDLL:
         library.acfdtd_run.restype = None
         library.acfdtd2d_struct_size.restype = ctypes.c_size_t
         library.acfdtd2d_run.restype = None
+        library.acfdtd2d_scalar_struct_size.restype = ctypes.c_size_t
+        library.acfdtd2d_scalar_run.restype = None
         _libraries[key] = library
     return _libraries[key]
 
@@ -246,6 +249,40 @@ def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
         ]
 
     return ScalarState
+
+
+def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
+    real = ctypes.c_double if dtype == np.float64 else ctypes.c_float
+    pointer = ctypes.POINTER(real)
+    index_pointer = ctypes.POINTER(ctypes.c_int64)
+
+    class ScalarState2D(ctypes.Structure):
+        _fields_ = [
+            ("nx", ctypes.c_int32),
+            ("ny", ctypes.c_int32),
+            ("n_wall", ctypes.c_int64),
+            ("n_sources", ctypes.c_int64),
+            ("n_receivers", ctypes.c_int64),
+            ("n_steps", ctypes.c_int64),
+            ("source_length", ctypes.c_int64),
+            ("lambda_squared", real),
+            ("src_coef", real),
+            ("current", pointer),
+            ("previous", pointer),
+            ("x_open", pointer),
+            ("y_open", pointer),
+            ("p_keep", pointer),
+            ("has_rigid", ctypes.c_int32),
+            ("wall_index", index_pointer),
+            ("wall_a", pointer),
+            ("wall_scratch", pointer),
+            ("source_index", index_pointer),
+            ("source_signal", pointer),
+            ("receiver_index", index_pointer),
+            ("recording", pointer),
+        ]
+
+    return ScalarState2D
 
 
 class CAcousticFDTD:
@@ -853,3 +890,180 @@ class CScalarFDTD:
         self._library.acfdtd_scalar_run(ctypes.byref(state))
         self.step_index += n_steps
         self._newest ^= n_steps & 1
+
+
+class CScalarFDTD2D:
+    """The pressure-only 2D scheme with its time loop compiled (``ac_fdtd.scalar2d`` in C).
+
+    Two cell arrays instead of three, one sweep instead of two: the fast, low-memory path for a
+    closed 2D room. It is the same scheme as :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`, not an
+    approximation — bit-identical to :class:`~ac_fdtd.scalar2d.ScalarFDTD2D` — with rigid and
+    locally-reacting walls, rigid obstacles, soft volume sources and pressure receivers. Open
+    boundaries (the CFS-CPML shell) and the matched layer are not compiled here yet; the NumPy
+    reference carries those.
+
+    As with the other compiled kernels :meth:`run` is the unit of work, and the two pressure levels
+    are ordinary NumPy arrays C writes into.
+    """
+
+    def __init__(
+        self,
+        grid: Grid2D,
+        medium: Medium = AIR,
+        courant: float = 1.0,
+        dtype: np.dtype = np.float64,
+        walls: WallAdmittances2D | None = None,
+        rigid_cells: np.ndarray | None = None,
+    ) -> None:
+        if not 0.0 < courant <= 1.0:
+            raise ValueError(f"courant must be in (0, 1], got {courant}")
+
+        self.grid = grid
+        self.medium = medium
+        self.courant = courant
+        self.dtype = np.dtype(dtype)
+        self.walls = walls or WallAdmittances2D()
+        self.dt = courant * max_stable_time_step_2d(grid.dx, medium.sound_speed)
+        self.step_index = 0
+
+        self._library = _library(self.dtype)
+        self._state_type = _scalar_structure_2d(self.dtype)
+        if ctypes.sizeof(self._state_type) != self._library.acfdtd2d_scalar_struct_size():
+            raise RuntimeError(
+                "the ctypes mirror of the 2D scalar C struct no longer matches the C definition: "
+                f"{ctypes.sizeof(self._state_type)} bytes here, "
+                f"{self._library.acfdtd2d_scalar_struct_size()} bytes there"
+            )
+
+        self._lambda_squared = (medium.sound_speed * self.dt / grid.dx) ** 2
+        self._src_coef = medium.density * medium.sound_speed**2 * self.dt
+
+        self._buffers = [
+            np.zeros(grid.shape, dtype=self.dtype),
+            np.zeros(grid.shape, dtype=self.dtype),
+        ]
+        self._newest = 0
+
+        indices, coefficient = wall_update_coefficients_2d(grid, medium, self.dt, self.walls)
+        self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
+        self._wall_a = coefficient.astype(self.dtype)
+        self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
+
+        self._has_rigid = rigid_cells is not None
+        if rigid_cells is None:
+            self._x_open = np.ones(1, dtype=self.dtype)
+            self._y_open = np.ones(1, dtype=self.dtype)
+            self._p_keep = np.ones(1, dtype=self.dtype)
+        else:
+            rigid = np.ascontiguousarray(rigid_cells, dtype=bool)
+            if rigid.shape != grid.shape:
+                raise ValueError(
+                    f"rigid_cells shape {rigid.shape} does not match the grid {grid.shape}"
+                )
+            self._x_open = np.ascontiguousarray(
+                (~(rigid[:-1, :] | rigid[1:, :])).astype(self.dtype).reshape(-1)
+            )
+            self._y_open = np.ascontiguousarray(
+                (~(rigid[:, :-1] | rigid[:, 1:])).astype(self.dtype).reshape(-1)
+            )
+            self._p_keep = np.ascontiguousarray((~rigid).astype(self.dtype).reshape(-1))
+
+        self._sources: list[tuple[tuple[int, int], np.ndarray]] = []
+        self._receivers: list[tuple[int, int]] = []
+        self._recordings: list[np.ndarray] = []
+
+    @property
+    def p(self) -> np.ndarray:
+        """The newest pressure level."""
+        return self._buffers[self._newest]
+
+    @property
+    def previous(self) -> np.ndarray:
+        return self._buffers[1 - self._newest]
+
+    @property
+    def sample_rate(self) -> float:
+        return 1.0 / self.dt
+
+    @property
+    def time(self) -> float:
+        return self.step_index * self.dt
+
+    @property
+    def threads(self) -> int:
+        return int(self._library.acfdtd_thread_count())
+
+    def set_threads(self, count: int) -> int:
+        return int(self._library.acfdtd_set_threads(int(count)))
+
+    def set_initial_pressure(self, field: np.ndarray) -> None:
+        """Start from a given pressure at rest — both levels equal, so the velocity is zero."""
+        for buffer in self._buffers:
+            buffer[:] = field
+
+    def add_volume_source(self, point: tuple[float, float], signal: np.ndarray) -> None:
+        self._sources.append((self.grid.cell_index(point), np.asarray(signal, dtype=self.dtype)))
+
+    def add_pressure_receiver(self, point: tuple[float, float]) -> int:
+        index = self.grid.cell_index(point)
+        flat = index[0] * self.grid.ny + index[1]
+        self._receivers.append((len(self._receivers), flat))
+        return len(self._receivers) - 1
+
+    @property
+    def recorded_pressure(self) -> np.ndarray:
+        if not self._recordings:
+            return np.zeros((len(self._receivers), 0))
+        return np.concatenate(self._recordings, axis=1)
+
+    def run(self, n_steps: int) -> None:
+        if n_steps <= 0:
+            return
+        real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
+
+        if self._sources:
+            length = max(len(signal) for _, signal in self._sources)
+            source_index = np.array(
+                [index[0] * self.grid.ny + index[1] for index, _ in self._sources], dtype=np.int64
+            )
+            source_signal = np.zeros((len(self._sources), length), dtype=self.dtype)
+            for row, (_, signal) in enumerate(self._sources):
+                source_signal[row, : len(signal)] = signal
+        else:
+            length = 0
+            source_index = np.zeros(0, dtype=np.int64)
+            source_signal = np.zeros((0, 0), dtype=self.dtype)
+
+        receiver_index = np.array([flat for _, flat in self._receivers], dtype=np.int64)
+        recording = np.zeros((len(self._receivers), n_steps), dtype=self.dtype)
+
+        source_signal = np.ascontiguousarray(source_signal)
+        state = self._state_type(
+            nx=self.grid.nx,
+            ny=self.grid.ny,
+            n_wall=self._wall_index.size,
+            n_sources=len(self._sources),
+            n_receivers=len(self._receivers),
+            n_steps=n_steps,
+            source_length=length,
+            lambda_squared=self.dtype.type(self._lambda_squared),
+            src_coef=self.dtype.type(self._src_coef),
+            current=self.p.ctypes.data_as(ctypes.POINTER(real)),
+            previous=self.previous.ctypes.data_as(ctypes.POINTER(real)),
+            x_open=self._x_open.ctypes.data_as(ctypes.POINTER(real)),
+            y_open=self._y_open.ctypes.data_as(ctypes.POINTER(real)),
+            p_keep=self._p_keep.ctypes.data_as(ctypes.POINTER(real)),
+            has_rigid=int(self._has_rigid),
+            wall_index=self._wall_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            wall_a=self._wall_a.ctypes.data_as(ctypes.POINTER(real)),
+            wall_scratch=self._wall_scratch.ctypes.data_as(ctypes.POINTER(real)),
+            source_index=source_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            source_signal=source_signal.ctypes.data_as(ctypes.POINTER(real)),
+            receiver_index=receiver_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            recording=recording.ctypes.data_as(ctypes.POINTER(real)),
+        )
+        self._library.acfdtd2d_scalar_run(ctypes.byref(state), ctypes.c_int64(self.step_index))
+        self.step_index += n_steps
+        self._newest ^= n_steps & 1
+        if self._receivers:
+            self._recordings.append(recording)

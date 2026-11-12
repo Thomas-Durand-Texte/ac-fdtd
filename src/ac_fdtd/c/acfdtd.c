@@ -725,3 +725,143 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
             s->recording[receiver * s->n_steps + step] = s->p[s->receiver_index[receiver]];
     }
 }
+
+/* ================================================= the pressure-only 2D kernel =========== */
+
+/* The plane counterpart of acfdtd_scalar: the pressure-velocity 2D scheme with the velocity
+ * eliminated, so two cell arrays instead of three and one sweep instead of two. It is the same
+ * scheme, not an approximation -- started from previous == current (v = 0) it reproduces
+ * AcousticFDTD2D to the last bit -- and it mirrors ac_fdtd.scalar2d.ScalarFDTD2D: a Neumann
+ * (mirrored-ghost) Laplacian for rigid walls, closed faces next to a solid cell for obstacles, and
+ * the three-level locally-reacting wall relation (1+a) p^{n+1} = 2 p^n - (1-a) p^{n-1} + lam^2 L_N,
+ * applied as a post-pass on the wall cells. Open boundaries (the CFS-CPML shell) are not here yet;
+ * this kernel is the fast path for a closed room. */
+typedef struct {
+    int32_t nx, ny;
+    int64_t n_wall;
+    int64_t n_sources;
+    int64_t n_receivers;
+    int64_t n_steps;
+    int64_t source_length;
+    REAL lambda_squared; /* (c dt / dx)^2 */
+    REAL src_coef;       /* rho c^2 dt */
+
+    REAL *current;
+    REAL *previous; /* the oldest level, overwritten with the newest; pointers swap each step */
+
+    /* Rigid obstacles (0/1 face-open factors and a solid-cell mask), all NULL when has_rigid is 0. */
+    const REAL *x_open; /* (nx-1)*ny: 0 on x-faces touching a solid, else 1 */
+    const REAL *y_open; /* nx*(ny-1): 0 on y-faces touching a solid, else 1 */
+    const REAL *p_keep; /* nx*ny: 0 on solid cells, else 1 */
+    int32_t has_rigid;
+
+    /* Locally-reacting walls, as the three-level relation. wall_a is a = c dt xi / (2 dx), summed
+     * over the walls at a corner; wall_scratch saves p^{n-1} at the wall cells before the sweep. */
+    const int64_t *wall_index;
+    const REAL *wall_a;
+    REAL *wall_scratch;
+
+    const int64_t *source_index;
+    const REAL *source_signal; /* n_sources rows of source_length */
+
+    const int64_t *receiver_index;
+    REAL *recording; /* n_receivers rows of n_steps */
+} acfdtd2d_scalar;
+
+size_t acfdtd2d_scalar_struct_size(void) { return sizeof(acfdtd2d_scalar); }
+
+/* One sweep writes the new level into `previous` from `current` (p^n) and `previous` (p^{n-1}).
+ * The y axis is contiguous. The rigid-wall Neumann condition is the boundary test on each face
+ * contributing nothing off the grid; obstacles close individual interior faces via the masks. */
+static void scalar_sweep_2d(const acfdtd2d_scalar *s, int32_t i_start, int32_t i_end) {
+    const int32_t nx = s->nx, ny = s->ny;
+    const REAL scale = s->lambda_squared;
+
+    for (int32_t i = i_start; i < i_end; i++) {
+        const int64_t row = (int64_t)i * ny;
+        const REAL *cur = s->current + row;
+        REAL *out = s->previous + row;
+        const REAL *cur_lo = cur - ny; /* row i-1 */
+        const REAL *cur_hi = cur + ny; /* row i+1 */
+
+        if (!s->has_rigid) {
+            for (int32_t j = 0; j < ny; j++) {
+                REAL lap = 0;
+                if (i > 0) lap += cur_lo[j] - cur[j];
+                if (i < nx - 1) lap += cur_hi[j] - cur[j];
+                if (j > 0) lap += cur[j - 1] - cur[j];
+                if (j < ny - 1) lap += cur[j + 1] - cur[j];
+                out[j] = 2 * cur[j] - out[j] + scale * lap;
+            }
+        } else {
+            const REAL *xo_lo = s->x_open + (int64_t)(i - 1) * ny; /* face (i-1,i) */
+            const REAL *xo_hi = s->x_open + row;                   /* face (i,i+1) */
+            const REAL *yo = s->y_open + (int64_t)i * (ny - 1);    /* faces (j,j+1) */
+            for (int32_t j = 0; j < ny; j++) {
+                REAL lap = 0;
+                if (i > 0) lap += xo_lo[j] * (cur_lo[j] - cur[j]);
+                if (i < nx - 1) lap += xo_hi[j] * (cur_hi[j] - cur[j]);
+                if (j > 0) lap += yo[j - 1] * (cur[j - 1] - cur[j]);
+                if (j < ny - 1) lap += yo[j] * (cur[j + 1] - cur[j]);
+                out[j] = 2 * cur[j] - out[j] + scale * lap;
+            }
+        }
+    }
+}
+
+static void zero_rigid_pressure_scalar_2d(const acfdtd2d_scalar *s, int32_t i_start, int32_t i_end) {
+    const int32_t ny = s->ny;
+    for (int32_t i = i_start; i < i_end; i++) {
+        REAL *p = s->previous + (int64_t)i * ny;
+        const REAL *keep = s->p_keep + (int64_t)i * ny;
+        for (int32_t j = 0; j < ny; j++) p[j] *= keep[j];
+    }
+}
+
+static void scalar_sweep_2d_dispatch(const void *state, int32_t start, int32_t end) {
+    scalar_sweep_2d((const acfdtd2d_scalar *)state, start, end);
+}
+static void zero_scalar_pressure_dispatch_2d(const void *state, int32_t start, int32_t end) {
+    zero_rigid_pressure_scalar_2d((const acfdtd2d_scalar *)state, start, end);
+}
+
+void acfdtd2d_scalar_run(acfdtd2d_scalar *s, int64_t step_offset) {
+    if (n_threads == 0) acfdtd_set_threads(0);
+
+    for (int64_t step = 0; step < s->n_steps; step++) {
+        const int64_t absolute = step_offset + step;
+
+        /* Save p^{n-1} at the wall cells before the sweep overwrites `previous`. */
+        for (int64_t w = 0; w < s->n_wall; w++) s->wall_scratch[w] = s->previous[s->wall_index[w]];
+
+        dispatch(s, scalar_sweep_2d_dispatch, s->nx);
+
+        /* Three-level wall post-pass: out_wall = (out_rigid + a p^{n-1}) / (1 + a). */
+        for (int64_t w = 0; w < s->n_wall; w++) {
+            const int64_t index = s->wall_index[w];
+            const REAL a = s->wall_a[w];
+            s->previous[index] = (s->previous[index] + a * s->wall_scratch[w]) / (1 + a);
+        }
+
+        /* Soft volume sources: the DIFFERENCE S_n - S_{n-1} (the eliminated divergence carries the
+         * previous sample). Written into the new level, matching the reference's order. */
+        for (int64_t src = 0; src < s->n_sources; src++) {
+            if (absolute < s->source_length) {
+                const REAL *sig = s->source_signal + src * s->source_length;
+                const REAL now = sig[absolute];
+                const REAL prev = (absolute > 0) ? sig[absolute - 1] : (REAL)0;
+                s->previous[s->source_index[src]] += s->src_coef * (now - prev);
+            }
+        }
+
+        if (s->has_rigid) dispatch(s, zero_scalar_pressure_dispatch_2d, s->nx);
+
+        /* Swap so `current` holds the newest level, then record from it. */
+        REAL *swap = s->current;
+        s->current = s->previous;
+        s->previous = swap;
+
+        for (int64_t rec = 0; rec < s->n_receivers; rec++)
+            s->recording[rec * s->n_steps + step] = s->current[s->receiver_index[rec]];
+    }
+}

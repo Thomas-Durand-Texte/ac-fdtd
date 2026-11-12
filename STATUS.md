@@ -22,16 +22,18 @@ and when; this file is the current picture and gets rewritten.
 | Analysis | Schroeder decay, TR20/TR30, EDT, C50, octave bands, Sabine/Eyring, Schroeder frequency |
 | Export | Polyphase resampling and 32-bit float wav |
 | Backends | NumPy (fp64), PyTorch (CPU/MPS/CUDA, fp32/fp64), C (pthreads, fp32/fp64); 2D has NumPy + a C kernel (`CAcousticFDTD2D`), no Torch yet |
-| Variant | Pressure-only C kernel, rigid walls only, ~5× the pressure–velocity form |
+| Variant | Pressure-only ("scalar", three-level) scheme: NumPy references **`ScalarFDTD2D`** / **`ScalarFDTD`** (3D) and a compiled **`CScalarFDTD2D`** — rigid + locally-reacting walls + rigid obstacles + volume sources + pressure & (reconstructed) velocity receivers, **bit-identical** to the p–v schemes, in **two cell arrays not 1+d** (measured −51% RAM in 3D, −33% in 2D). The 2D C kernel runs 1.8–2.5× the p–v C kernel; the 3D C kernel is the remaining step |
+| Open boundary | Both scalar schemes take a **CFS-CPML** (`AbsorbingBoundary` / `AbsorbingBoundary2D`) on any subset of walls: a true PML, measured −45 dB+ absorbing a pulse into the corners (all angles), far past the sponge layer and the locally-reacting wall (which saturates near −13 dB obliquely). Velocity + the memory fields live only in the boundary shell, so a closed room is still two arrays. A shallow tuned skin (`partial_skin`) is the same mechanism as an angle-robust partial absorber |
 
 ## What is deliberately not there
 
 - **Non-rectangular geometry.** No cut cells, no unstructured meshes; staircasing only.
 - **Frequency-dependent wall impedance.** Walls are a single real admittance. An IIR boundary
   fitted to octave-band absorption data is in `PLAN.md` and not implemented.
-- **A true PML.** The absorbing layer is a matched sponge: exact at normal incidence, −17 to
-  −31 dB in a real 3D field depending on receiver clearance. Beating that needs coordinate
-  stretching.
+- **A true PML.** The matched sponge (−17 to −31 dB in a real 3D field) is still all the p–v
+  scheme and the 3D path have. The 2D *pressure-only* scheme now has a CFS-CPML
+  (`AbsorbingBoundary2D`, −45 dB+ at all angles including corners); porting it to the p–v form and
+  to 3D is open.
 - **Fourth order in space.** Analysed, not implemented — see below.
 - **Moving sources or media, flow, temperature gradients.**
 - **Auralisation.** This produces impulse responses; convolution and HRTF are someone else's job.
@@ -40,11 +42,19 @@ and when; this file is the current picture and gets rewritten.
 
 ## What to do next, in value order
 
-1. **Three-level boundary conditions for the pressure-only variant.** Measured at **5×** the
-   pressure–velocity form, which is more than any other lever in the project — more than the
-   GPU, more than the loop fusion. What it needs is the impedance wall, the absorbing layer and
-   the relaxation states re-derived as three-level relations. The kernel and its equivalence
-   test already exist; this is the work that makes it usable.
+1. **Pressure-only ("scalar") backend — in progress.** The three-level boundary derivations are
+   done and validated (see `docs/kernel_study/`): rigid, locally-reacting impedance walls
+   (`(1+a)p^{n+1} = 2p^n − (1−a)p^{n−1} + λ²L_N`), rigid obstacles, and the difference-injected
+   soft source. The NumPy references **`ScalarFDTD2D`** and **`ScalarFDTD`** (3D) have
+   landed, bit-identical to the p–v schemes in two arrays not 1+d (measured −51% RAM in 3D; the
+   compiled speed-up was 2–3× in earlier benchmarks, the older "5×" optimistic), both carrying the
+   **CFS-CPML open boundary** (−45 dB+ at all angles including corners, plus a tunable
+   `partial_skin` that beats the locally-reacting wall). The **compiled 2D kernel `CScalarFDTD2D`**
+   (three-level walls + obstacles + volume sources + receivers) has landed too — bit-identical to
+   the reference, 1.8–2.5× the p–v C kernel. Still to do, in order: the **3D C kernel** (extend
+   `CScalarFDTD` with walls/obstacles) and the **CPML shell in C**; then adapter + auto-selection in
+   the app. Air relaxation ports too (reconstruct the divergence from the two pressure levels, +1
+   array/process); the matched sponge does not — the CPML is its pressure-only replacement.
 
 2. **Fourth order in space.** A further **6.8× fewer cell-updates** for the same 1 % phase
    error. The design is settled and written down: build the gradient with whatever stencils the
