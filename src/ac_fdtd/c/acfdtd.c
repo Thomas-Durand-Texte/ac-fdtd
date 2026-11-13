@@ -270,7 +270,58 @@ typedef struct {
     const REAL *z_open;
     const REAL *p_keep;
     int32_t has_rigid;
+
+    /* The CFS-CPML shell, as ac_fdtd.scalar.ScalarFDTD._apply_cpml computes it; n_cpml_regions is
+     * 0 without one. The 2D kernel's layout (acfdtd2d_scalar) with one more axis: the shell is
+     * cut into disjoint boxes, one per lined wall (the x slabs take the full y-z cross-section, the
+     * y slabs fill between the x slabs, the z slabs between both), and each box stores its own
+     * cells and every face bordering them, C-ordered over the box with z contiguous: psi_px,
+     * psi_py, psi_pz on ni*nj*nk cells, vx and psi_vx on (ni+1)*nj*nk faces, vy and psi_vy on
+     * ni*(nj+1)*nk, vz and psi_vz on ni*nj*(nk+1), at the offsets in cpml_region. A face on the
+     * border of two boxes (an edge or a corner of the shell) is stored twice; both copies see
+     * the same p^n and the same profiles from the same zero start, so they stay equal to the
+     * last bit, and no box reads another's storage, which lets the boxes run with no
+     * synchronisation beyond the barrier between the face sweep and the cell sweep. The domain's
+     * own wall planes (face 0 and face n) are never updated and stay at zero, as there. Units are
+     * the dispatch extents: one velocity unit per x-face plane of a box, one pressure unit per
+     * cell plane. */
+    int64_t n_cpml_regions;
+    const int64_t *cpml_region; /* CPML3_COLUMNS entries per region, see the enum below */
+    int32_t cpml_velocity_units;
+    int32_t cpml_pressure_units;
+    REAL inverse_dx; /* 1/dx: the CPML gradients carry it explicitly */
+    REAL cpml_cv;    /* dt / rho */
+    REAL cpml_cp;    /* rho c^2 dt */
+    /* Profiles from cpml_axis_profiles_3d: _p at cell centres (n), _v at faces (n + 1). */
+    const REAL *kx_p, *bx_p, *ax_p;
+    const REAL *ky_p, *by_p, *ay_p;
+    const REAL *kz_p, *bz_p, *az_p;
+    const REAL *kx_v, *bx_v, *ax_v;
+    const REAL *ky_v, *by_v, *ay_v;
+    const REAL *kz_v, *bz_v, *az_v;
+    REAL *vx, *psi_vx;
+    REAL *vy, *psi_vy;
+    REAL *vz, *psi_vz;
+    REAL *psi_px, *psi_py, *psi_pz;
 } acfdtd_scalar;
+
+/* Columns of one row of cpml_region: the box [i0, i1) x [j0, j1) x [k0, k1), its offsets into the
+ * cell, x-face, y-face and z-face pools, and the first velocity and pressure unit it owns. */
+enum {
+    CPML3_I0,
+    CPML3_I1,
+    CPML3_J0,
+    CPML3_J1,
+    CPML3_K0,
+    CPML3_K1,
+    CPML3_CELLS,
+    CPML3_XFACES,
+    CPML3_YFACES,
+    CPML3_ZFACES,
+    CPML3_VUNIT,
+    CPML3_PUNIT,
+    CPML3_COLUMNS
+};
 
 size_t acfdtd_scalar_struct_size(void) { return sizeof(acfdtd_scalar); }
 
@@ -402,6 +453,142 @@ static void zero_rigid_pressure(const acfdtd_scalar *s, int32_t i_start, int32_t
         if (s->p_keep[c] == 0) s->previous[c] = 0;
 }
 
+/* The box a dispatch unit belongs to: there are at most six, so a scan is as fast as any lookup.
+ * `column` is CPML3_VUNIT or CPML3_PUNIT; `rows_extra` is 1 for face planes (one more than cell
+ * planes), 0 for cell planes. */
+static const int64_t *cpml_region_of_3d(const acfdtd_scalar *s, int32_t unit, int column,
+                                        int rows_extra) {
+    for (int64_t k = 0; k < s->n_cpml_regions; k++) {
+        const int64_t *region = s->cpml_region + k * CPML3_COLUMNS;
+        const int64_t rows = region[CPML3_I1] - region[CPML3_I0] + rows_extra;
+        if (unit >= region[column] && unit < region[column] + rows) return region;
+    }
+    return NULL;
+}
+
+/* The CPML velocity step of ac_fdtd.scalar.ScalarFDTD._apply_cpml, one x-face plane per unit: the
+ * x faces of plane i0 + r and, while r is a cell plane, the y and z faces of that cell plane. Per
+ * face, in the reference's operation order:
+ *     g = (p_upper - p_lower) * (1/dx)
+ *     psi = b psi + a g
+ *     v = v - cv (g / kappa + psi)
+ * reading only p^n (`current`), so every face is independent of every other. */
+static void cpml_velocity_3d(const acfdtd_scalar *s, int32_t start, int32_t end) {
+    const int32_t nx = s->nx, ny = s->ny, nz = s->nz;
+    const int64_t stride_x = (int64_t)ny * nz;
+    const REAL inverse_dx = s->inverse_dx, cv = s->cpml_cv;
+    const REAL *cur = s->current;
+    for (int32_t unit = start; unit < end; unit++) {
+        const int64_t *region = cpml_region_of_3d(s, unit, CPML3_VUNIT, 1);
+        const int64_t i0 = region[CPML3_I0], i1 = region[CPML3_I1];
+        const int64_t j0 = region[CPML3_J0], nj = region[CPML3_J1] - j0;
+        const int64_t k0 = region[CPML3_K0], nk = region[CPML3_K1] - k0;
+        const int64_t r = unit - region[CPML3_VUNIT];
+
+        const int64_t fi = i0 + r; /* x face between cells fi - 1 and fi */
+        if (fi > 0 && fi < nx) {
+            REAL *v = s->vx + region[CPML3_XFACES] + r * nj * nk;
+            REAL *psi = s->psi_vx + region[CPML3_XFACES] + r * nj * nk;
+            const REAL b = s->bx_v[fi], a = s->ax_v[fi], kappa = s->kx_v[fi];
+            for (int64_t cj = 0; cj < nj; cj++) {
+                for (int64_t ck = 0; ck < nk; ck++) {
+                    const int64_t f = cj * nk + ck;
+                    const int64_t here = fi * stride_x + (j0 + cj) * nz + k0 + ck;
+                    const REAL g = (cur[here] - cur[here - stride_x]) * inverse_dx;
+                    psi[f] = b * psi[f] + a * g;
+                    v[f] = v[f] - cv * (g / kappa + psi[f]);
+                }
+            }
+        }
+
+        if (r < i1 - i0) {
+            const int64_t i = i0 + r;
+            REAL *v = s->vy + region[CPML3_YFACES] + r * (nj + 1) * nk;
+            REAL *psi = s->psi_vy + region[CPML3_YFACES] + r * (nj + 1) * nk;
+            for (int64_t cj = 0; cj <= nj; cj++) {
+                const int64_t fj = j0 + cj; /* y face between cells fj - 1 and fj */
+                if (fj <= 0 || fj >= ny) continue;
+                const REAL b = s->by_v[fj], a = s->ay_v[fj], kappa = s->ky_v[fj];
+                for (int64_t ck = 0; ck < nk; ck++) {
+                    const int64_t f = cj * nk + ck;
+                    const int64_t here = i * stride_x + fj * nz + k0 + ck;
+                    const REAL g = (cur[here] - cur[here - nz]) * inverse_dx;
+                    psi[f] = b * psi[f] + a * g;
+                    v[f] = v[f] - cv * (g / kappa + psi[f]);
+                }
+            }
+
+            v = s->vz + region[CPML3_ZFACES] + r * nj * (nk + 1);
+            psi = s->psi_vz + region[CPML3_ZFACES] + r * nj * (nk + 1);
+            for (int64_t cj = 0; cj < nj; cj++) {
+                for (int64_t ck = 0; ck <= nk; ck++) {
+                    const int64_t fk = k0 + ck; /* z face between cells fk - 1 and fk */
+                    if (fk <= 0 || fk >= nz) continue;
+                    const int64_t f = cj * (nk + 1) + ck;
+                    const int64_t here = i * stride_x + (j0 + cj) * nz + fk;
+                    const REAL g = (cur[here] - cur[here - 1]) * inverse_dx;
+                    psi[f] = s->bz_v[fk] * psi[f] + s->az_v[fk] * g;
+                    v[f] = v[f] - cv * (g / s->kz_v[fk] + psi[f]);
+                }
+            }
+        }
+    }
+}
+
+/* The CPML pressure step, one cell plane per unit, overwriting p^{n+1} (`previous`) on the shell:
+ *     d_x = (vx_upper - vx_lower) * (1/dx),   psi_px = b psi_px + a d_x     (same on y, z)
+ *     p^{n+1} = p^n - cp (((d_x / kappa_x + psi_px) + (d_y / kappa_y + psi_py))
+ *                          + (d_z / kappa_z + psi_pz))
+ * The sum is grouped as the reference accumulates it: a zeroed array with each axis' whole term
+ * added in turn, so it starts from 0 here too (0 + t is t except for the sign of a zero). Reads
+ * only this box's faces, written by the previous sweep. */
+static void cpml_pressure_3d(const acfdtd_scalar *s, int32_t start, int32_t end) {
+    const int32_t ny = s->ny, nz = s->nz;
+    const int64_t stride_x = (int64_t)ny * nz;
+    const REAL inverse_dx = s->inverse_dx, cp = s->cpml_cp;
+    const REAL *cur = s->current;
+    REAL *out = s->previous;
+    for (int32_t unit = start; unit < end; unit++) {
+        const int64_t *region = cpml_region_of_3d(s, unit, CPML3_PUNIT, 0);
+        const int64_t j0 = region[CPML3_J0], nj = region[CPML3_J1] - j0;
+        const int64_t k0 = region[CPML3_K0], nk = region[CPML3_K1] - k0;
+        const int64_t r = unit - region[CPML3_PUNIT];
+        const int64_t i = region[CPML3_I0] + r;
+
+        const REAL *vx_lower = s->vx + region[CPML3_XFACES] + r * nj * nk;
+        const REAL *vx_upper = vx_lower + nj * nk;
+        const REAL *vy = s->vy + region[CPML3_YFACES] + r * (nj + 1) * nk;
+        const REAL *vz = s->vz + region[CPML3_ZFACES] + r * nj * (nk + 1);
+        const int64_t cells = region[CPML3_CELLS] + r * nj * nk;
+        REAL *psi_x = s->psi_px + cells;
+        REAL *psi_y = s->psi_py + cells;
+        REAL *psi_z = s->psi_pz + cells;
+        const REAL bx = s->bx_p[i], ax = s->ax_p[i], kx = s->kx_p[i];
+        for (int64_t cj = 0; cj < nj; cj++) {
+            const int64_t j = j0 + cj;
+            const REAL by = s->by_p[j], ay = s->ay_p[j], ky = s->ky_p[j];
+            for (int64_t ck = 0; ck < nk; ck++) {
+                const int64_t k = k0 + ck;
+                const int64_t c = cj * nk + ck;
+                const int64_t fy = cj * nk + ck; /* lower y face; the upper one is nk further */
+                const int64_t fz = cj * (nk + 1) + ck;
+                const REAL divergence_x = (vx_upper[c] - vx_lower[c]) * inverse_dx;
+                psi_x[c] = bx * psi_x[c] + ax * divergence_x;
+                const REAL divergence_y = (vy[fy + nk] - vy[fy]) * inverse_dx;
+                psi_y[c] = by * psi_y[c] + ay * divergence_y;
+                const REAL divergence_z = (vz[fz + 1] - vz[fz]) * inverse_dx;
+                psi_z[c] = s->bz_p[k] * psi_z[c] + s->az_p[k] * divergence_z;
+                REAL sum = 0;
+                sum += divergence_x / kx + psi_x[c];
+                sum += divergence_y / ky + psi_y[c];
+                sum += divergence_z / s->kz_p[k] + psi_z[c];
+                const int64_t cell = i * stride_x + j * nz + k;
+                out[cell] = cur[cell] - cp * sum;
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------- the thread pool --- */
 
 /* One pool, shared by every kernel. A sweep is a function plus the range of planes to run it
@@ -443,6 +630,14 @@ static void exact_wave_sweep(const void *state, int32_t start, int32_t end) {
 
 static void zero_rigid_sweep(const void *state, int32_t start, int32_t end) {
     zero_rigid_pressure((const acfdtd_scalar *)state, start, end);
+}
+
+static void cpml_velocity_sweep(const void *state, int32_t start, int32_t end) {
+    cpml_velocity_3d((const acfdtd_scalar *)state, start, end);
+}
+
+static void cpml_pressure_sweep(const void *state, int32_t start, int32_t end) {
+    cpml_pressure_3d((const acfdtd_scalar *)state, start, end);
 }
 
 /* An equal share of the slowest axis each, so every thread owns one contiguous block of
@@ -625,7 +820,8 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
                 (lower >= 0) ? s->current[s->velocity_cell[r]] - s->current[lower] : (REAL)0;
         }
 
-        if (s->n_wall || s->has_rigid) {
+        /* A shell needs the exact sweep too: its interior neighbours are compared to the bit. */
+        if (s->n_wall || s->has_rigid || s->n_cpml_regions) {
             /* Save p^{n-1} at the wall cells before the sweep overwrites `previous`. */
             for (int64_t w = 0; w < s->n_wall; w++)
                 s->wall_scratch[w] = s->previous[s->wall_index[w]];
@@ -633,6 +829,14 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
             finish_scalar_walls(s);
         } else {
             dispatch(s, wave_sweep, s->nx);
+        }
+
+        /* The CPML shell overwrites the scalar update on its cells, after the walls (whose shell
+         * entries were dropped, so they never reach a shell cell) and before the sources: the
+         * reference's order. Faces first, then cells, a barrier between. */
+        if (s->n_cpml_regions) {
+            dispatch(s, cpml_velocity_sweep, s->cpml_velocity_units);
+            dispatch(s, cpml_pressure_sweep, s->cpml_pressure_units);
         }
 
         /* Soft sources after the wall solve, so a source on a wall cell is not divided by 1 + a.

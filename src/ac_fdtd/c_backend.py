@@ -36,6 +36,7 @@ from .boundaries2d import (
     layer_factors_2d,
     wall_update_coefficients_2d,
 )
+from .cpml import AbsorbingBoundary, cpml_axis_profiles_3d
 from .cpml2d import AbsorbingBoundary2D, cpml_axis_profiles
 from .grid import Grid, max_stable_time_step
 from .grid2d import Grid2D, max_stable_time_step_2d
@@ -270,9 +271,31 @@ def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
             ("z_open", ctypes.POINTER(real)),
             ("p_keep", ctypes.POINTER(real)),
             ("has_rigid", ctypes.c_int32),
+            ("n_cpml_regions", ctypes.c_int64),
+            ("cpml_region", ctypes.POINTER(ctypes.c_int64)),
+            ("cpml_velocity_units", ctypes.c_int32),
+            ("cpml_pressure_units", ctypes.c_int32),
+            ("inverse_dx", real),
+            ("cpml_cv", real),
+            ("cpml_cp", real),
+            *((name, ctypes.POINTER(real)) for name in _CPML_PROFILE_NAMES_3D),
+            *((name, ctypes.POINTER(real)) for name in _CPML_FIELD_NAMES_3D),
         ]
 
     return ScalarState
+
+
+# The CPML arrays of the 3D scalar struct, in struct order. Profiles: (kappa, b, a) at cell centres
+# then at faces, x, y, z. Fields: the per-box pools of the shell state.
+_CPML_PROFILE_NAMES_3D = (
+    "kx_p", "bx_p", "ax_p", "ky_p", "by_p", "ay_p", "kz_p", "bz_p", "az_p",
+    "kx_v", "bx_v", "ax_v", "ky_v", "by_v", "ay_v", "kz_v", "bz_v", "az_v",
+)  # fmt: skip
+_CPML_FIELD_NAMES_3D = (
+    "vx", "psi_vx", "vy", "psi_vy", "vz", "psi_vz", "psi_px", "psi_py", "psi_pz",
+)  # fmt: skip
+# Columns of one row of the 3D region table; must match the CPML3_* enum of the C file.
+_CPML_COLUMNS_3D = 12
 
 
 def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
@@ -888,8 +911,13 @@ class CScalarFDTD:
     it is bit-identical to ``ScalarFDTD`` in fp64; the all-rigid room keeps a faster sweep that
     agrees to round-off. Rigid obstacles (``rigid_cells``) close every face touching a solid cell
     and zero the solid cells after each step, as the reference does; a mask with any solid cell
-    selects the exact sweep, so it is bit-identical too, all-rigid room included. The absorbing
-    layer and the relaxation states are not compiled here.
+    selects the exact sweep, so it is bit-identical too, all-rigid room included.
+
+    An open boundary (``absorbing_boundary``) is the reference's CFS-CPML shell, bit-identical in
+    fp64: a p-v + CPML update on the shell cells overwriting the scalar update there, with the
+    velocity and memory fields stored per lined wall in slabs of the shell only (see
+    :meth:`_setup_cpml`), so the interior is still two arrays. A shell selects the exact sweep.
+    The relaxation states (air absorption) are not compiled here.
 
     Soft volume sources and pressure and velocity receivers follow the reference too, with the same
     signatures. Their tables are handed to C once per :meth:`run` chunk and the recordings of
@@ -904,6 +932,7 @@ class CScalarFDTD:
         dtype: np.dtype = np.float64,
         walls: WallAdmittances | None = None,
         rigid_cells: np.ndarray | None = None,
+        absorbing_boundary: AbsorbingBoundary | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -912,6 +941,7 @@ class CScalarFDTD:
         self.medium = medium
         self.courant = courant
         self.walls = walls or WallAdmittances()
+        self.absorbing_boundary = absorbing_boundary
         self.dtype = np.dtype(dtype)
         self.dt = courant * max_stable_time_step(grid.dx, medium.sound_speed)
         self.step_index = 0
@@ -937,6 +967,14 @@ class CScalarFDTD:
         indices, coefficient = wall_update_coefficients(grid, medium, self.dt, self.walls)
         self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
         self._wall_a = coefficient.astype(self.dtype)
+
+        self._cpml_region = np.zeros(0, dtype=np.int64)
+        self._cpml_units = (0, 0)
+        self._cpml_constants = (0.0, 0.0, 0.0)
+        self._cpml_profiles: list[np.ndarray] = []
+        self._cpml_fields: list[np.ndarray] = []
+        if absorbing_boundary is not None:
+            self._setup_cpml(absorbing_boundary)
         self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
 
         # Rigid obstacles as the reference builds them: per axis, a face is open iff neither of its
@@ -990,6 +1028,92 @@ class CScalarFDTD:
     @property
     def time(self) -> float:
         return self.step_index * self.dt
+
+    def _setup_cpml(self, boundary: AbsorbingBoundary) -> None:
+        """The shell of ``ScalarFDTD._setup_cpml``, cut into one box per lined wall.
+
+        The reference keeps the shell state on full-grid arrays and masks its updates; here each
+        lined wall gets a box of the shell: the x slabs take the whole y-z cross-section, the y
+        slabs fill the x range between them, the z slabs the x-y rectangle between both. The boxes
+        are disjoint and cover exactly the shell; each stores its cells and every face bordering
+        them, so a face on an edge or corner of the shell is stored by two boxes (the C struct
+        explains why that is safe). Profiles and constants are cast as the reference casts them,
+        so the kernel multiplies the same rounded numbers.
+        """
+        grid = self.grid
+        shape = grid.shape
+        thickness = boundary.thickness
+        if 2 * thickness >= min(shape):
+            raise ValueError(f"absorbing layer of {thickness} cells does not fit a {shape} grid")
+
+        profiles = cpml_axis_profiles_3d(grid, self.medium, self.dt, boundary)
+        self._cpml_profiles = [
+            np.ascontiguousarray(c, dtype=self.dtype)
+            for kind in ("p", "v")
+            for axis in range(3)
+            for c in profiles[(kind, axis)]
+        ]
+        cast = self.dtype.type
+        self._cpml_constants = (
+            cast(1.0 / grid.dx),
+            cast(self.dt / self.medium.density),
+            cast(self.medium.density * self.medium.sound_speed**2 * self.dt),
+        )
+
+        # Per axis, the range of cells left once that axis' lined slabs are taken off.
+        lined = [boundary.has_axis(axis) for axis in range(3)]
+        inner = [
+            (thickness if low else 0, n - thickness if high else n)
+            for n, (low, high) in zip(shape, lined, strict=True)
+        ]
+        boxes = []
+        for axis in range(3):
+            for side, is_lined in enumerate(lined[axis]):
+                if not is_lined:
+                    continue
+                n = shape[axis]
+                bounds = [(0, size) for size in shape]
+                bounds[axis] = (0, thickness) if side == 0 else (n - thickness, n)
+                for earlier in range(axis):  # the axes whose slabs already took the edges
+                    bounds[earlier] = inner[earlier]
+                boxes.append(bounds)
+
+        # One row per box: bounds, pool offsets (cells, x, y, z faces), first units.
+        rows = []
+        cells = x_faces = y_faces = z_faces = velocity_units = pressure_units = 0
+        for (i0, i1), (j0, j1), (k0, k1) in boxes:
+            rows.append(
+                (i0, i1, j0, j1, k0, k1, cells, x_faces, y_faces, z_faces)
+                + (velocity_units, pressure_units)
+            )
+            ni, nj, nk = i1 - i0, j1 - j0, k1 - k0
+            cells += ni * nj * nk
+            x_faces += (ni + 1) * nj * nk
+            y_faces += ni * (nj + 1) * nk
+            z_faces += ni * nj * (nk + 1)
+            velocity_units += ni + 1
+            pressure_units += ni
+        self._cpml_region = np.array(rows, dtype=np.int64).reshape(-1)
+        self._cpml_units = (velocity_units, pressure_units)
+        # vx, psi_vx, vy, psi_vy, vz, psi_vz, psi_px, psi_py, psi_pz: the state that persists
+        # across run calls. ``faces=()`` leaves them empty, a valid (empty) shell as there.
+        self._cpml_fields = [
+            np.zeros(size, dtype=self.dtype)
+            for size in (x_faces, x_faces, y_faces, y_faces, z_faces, z_faces, cells, cells, cells)
+        ]
+
+        # As in the reference, the impedance-wall correction applies to interior wall cells only.
+        # Membership is tested on the coordinates: a grid-sized shell mask is what this avoids.
+        if self._wall_index.size:
+            coordinates = np.unravel_index(self._wall_index, shape)
+            in_shell = np.zeros(self._wall_index.size, dtype=bool)
+            for axis, (low, high) in enumerate(lined):
+                if low:
+                    in_shell |= coordinates[axis] < thickness
+                if high:
+                    in_shell |= coordinates[axis] >= shape[axis] - thickness
+            self._wall_index = np.ascontiguousarray(self._wall_index[~in_shell])
+            self._wall_a = self._wall_a[~in_shell]
 
     def _flat(self, cell: tuple[int, ...]) -> int:
         return (cell[0] * self.grid.ny + cell[1]) * self.grid.nz + cell[2]
@@ -1107,7 +1231,20 @@ class CScalarFDTD:
             z_open=self._open[2].ctypes.data_as(real_pointer),
             p_keep=self._p_keep.ctypes.data_as(real_pointer),
             has_rigid=int(self._has_rigid),
+            n_cpml_regions=self._cpml_region.size // _CPML_COLUMNS_3D,
+            cpml_region=self._cpml_region.ctypes.data_as(index_pointer),
+            cpml_velocity_units=self._cpml_units[0],
+            cpml_pressure_units=self._cpml_units[1],
+            inverse_dx=self._cpml_constants[0],
+            cpml_cv=self._cpml_constants[1],
+            cpml_cp=self._cpml_constants[2],
         )
+        # The shell arrays, set by name; left NULL without a shell (n_cpml_regions is then 0). The
+        # field pools are written in place, so the shell state carries into the next run.
+        for name, array in zip(_CPML_PROFILE_NAMES_3D, self._cpml_profiles, strict=False):
+            setattr(state, name, array.ctypes.data_as(real_pointer))
+        for name, array in zip(_CPML_FIELD_NAMES_3D, self._cpml_fields, strict=False):
+            setattr(state, name, array.ctypes.data_as(real_pointer))
         self._library.acfdtd_scalar_run(ctypes.byref(state))
         self.step_index += n_steps
         self._newest ^= n_steps & 1
