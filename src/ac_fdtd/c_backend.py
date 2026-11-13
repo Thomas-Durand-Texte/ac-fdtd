@@ -250,6 +250,20 @@ def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
             ("wall_index", ctypes.POINTER(ctypes.c_int64)),
             ("wall_a", ctypes.POINTER(real)),
             ("wall_scratch", ctypes.POINTER(real)),
+            ("step_offset", ctypes.c_int64),
+            ("src_coef", real),
+            ("n_sources", ctypes.c_int64),
+            ("source_index", ctypes.POINTER(ctypes.c_int64)),
+            ("source_offset", ctypes.POINTER(ctypes.c_int64)),
+            ("source_length", ctypes.POINTER(ctypes.c_int64)),
+            ("source_pool", ctypes.POINTER(real)),
+            ("n_receivers", ctypes.c_int64),
+            ("receiver_index", ctypes.POINTER(ctypes.c_int64)),
+            ("recording", ctypes.POINTER(real)),
+            ("n_velocity", ctypes.c_int64),
+            ("velocity_cell", ctypes.POINTER(ctypes.c_int64)),
+            ("velocity_lower", ctypes.POINTER(ctypes.c_int64)),
+            ("velocity_difference", ctypes.POINTER(real)),
         ]
 
     return ScalarState
@@ -847,6 +861,10 @@ class CScalarFDTD:
     any absorbing wall the kernel evaluates the reference's arithmetic in the reference's order, so
     it is bit-identical to ``ScalarFDTD`` in fp64; the all-rigid room keeps a faster sweep that
     agrees to round-off. The absorbing layer and the relaxation states are not compiled here.
+
+    Soft volume sources and pressure and velocity receivers follow the reference too, with the same
+    signatures. Their tables are handed to C once per :meth:`run` chunk and the recordings of
+    successive chunks are concatenated, so a run can be split anywhere.
     """
 
     def __init__(
@@ -891,10 +909,74 @@ class CScalarFDTD:
         self._wall_a = coefficient.astype(self.dtype)
         self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
 
+        # Cast as ScalarFDTD casts it; the velocity coefficient stays a Python float, as there.
+        self._src_coef = self.dtype.type(medium.density * medium.sound_speed**2 * self.dt)
+        self._vel_coef = self.dt / (medium.density * grid.dx)
+
+        self._sources: list[tuple[int, np.ndarray]] = []
+        self._receivers: list[int] = []
+        self._recordings: list[np.ndarray] = []
+        # Velocity probes: (flat cell, flat cell below along the axis or -1 on the lower wall).
+        # The running value v^{n-1/2} of each is carried across chunks in fp64, as the reference
+        # carries it.
+        self._velocity_probes: list[tuple[int, int]] = []
+        self._velocity_running = np.zeros(0)
+        self._velocity_recordings: list[np.ndarray] = []
+
     @property
     def p(self) -> np.ndarray:
         """The newest pressure level."""
         return self._buffers[self._newest]
+
+    @property
+    def sample_rate(self) -> float:
+        return 1.0 / self.dt
+
+    @property
+    def time(self) -> float:
+        return self.step_index * self.dt
+
+    def _flat(self, cell: tuple[int, ...]) -> int:
+        return (cell[0] * self.grid.ny + cell[1]) * self.grid.nz + cell[2]
+
+    def add_volume_source(self, point: tuple[float, float, float], signal: np.ndarray) -> None:
+        """A soft source on the simulation's clock: sample ``k`` belongs to global step ``k``."""
+        cell = self.grid.cell_index(point)
+        self._sources.append((self._flat(cell), np.asarray(signal, dtype=self.dtype)))
+
+    def add_pressure_receiver(self, point: tuple[float, float, float]) -> int:
+        self._receivers.append(self._flat(self.grid.cell_index(point)))
+        return len(self._receivers) - 1
+
+    def add_velocity_receiver(self, point: tuple[float, float, float], axis: int) -> int:
+        """``v^{n-1/2}`` on the lower face of ``point`` along ``axis``, rebuilt from the two cells
+        as :meth:`ac_fdtd.scalar.ScalarFDTD.add_velocity_receiver` does; zero on a lower wall."""
+        cell = self.grid.cell_index(point)
+        if cell[axis] > 0:
+            below = list(cell)
+            below[axis] -= 1
+            lower = self._flat(tuple(below))
+        else:
+            lower = -1
+        self._velocity_probes.append((self._flat(cell), lower))
+        self._velocity_running = np.append(self._velocity_running, 0.0)
+        return len(self._velocity_probes) - 1
+
+    @property
+    def recorded_pressure(self) -> np.ndarray:
+        if not self._receivers:
+            return np.zeros((0, 0))
+        if not self._recordings:
+            return np.zeros((len(self._receivers), 0), dtype=self.dtype)
+        return np.concatenate(self._recordings, axis=1)
+
+    @property
+    def recorded_velocity(self) -> np.ndarray:
+        if not self._velocity_probes:
+            return np.zeros((0, 0))
+        if not self._velocity_recordings:
+            return np.zeros((len(self._velocity_probes), 0))
+        return np.concatenate(self._velocity_recordings, axis=1)
 
     @property
     def previous(self) -> np.ndarray:
@@ -918,6 +1000,27 @@ class CScalarFDTD:
         if n_steps <= 0:
             return
         real = ctypes.c_double if self.dtype == np.float64 else ctypes.c_float
+        real_pointer = ctypes.POINTER(real)
+        index_pointer = ctypes.POINTER(ctypes.c_int64)
+
+        # Built once per chunk, never per step: the C loop does not call back into Python.
+        # The signals go in whole, one after another; C indexes them by the global step.
+        source_index = np.array([flat for flat, _ in self._sources], dtype=np.int64)
+        source_length = np.array([signal.size for _, signal in self._sources], dtype=np.int64)
+        source_offset = np.zeros(len(self._sources), dtype=np.int64)
+        if self._sources:
+            source_offset[1:] = np.cumsum(source_length)[:-1]
+        # One spare element, so the pool has an address even when every signal is empty.
+        source_pool = np.ascontiguousarray(
+            np.concatenate([signal for _, signal in self._sources] + [np.zeros(1, self.dtype)]),
+            dtype=self.dtype,
+        )
+        receiver_index = np.array(self._receivers, dtype=np.int64)
+        recording = np.zeros((len(self._receivers), n_steps), dtype=self.dtype)
+        velocity_cell = np.array([cell for cell, _ in self._velocity_probes], dtype=np.int64)
+        velocity_lower = np.array([lower for _, lower in self._velocity_probes], dtype=np.int64)
+        velocity_difference = np.zeros((len(self._velocity_probes), n_steps), dtype=self.dtype)
+
         state = self._state_type(
             nx=self.grid.nx,
             ny=self.grid.ny,
@@ -930,10 +1033,45 @@ class CScalarFDTD:
             wall_index=self._wall_index.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             wall_a=self._wall_a.ctypes.data_as(ctypes.POINTER(real)),
             wall_scratch=self._wall_scratch.ctypes.data_as(ctypes.POINTER(real)),
+            step_offset=self.step_index,
+            src_coef=self._src_coef,
+            n_sources=len(self._sources),
+            source_index=source_index.ctypes.data_as(index_pointer),
+            source_offset=source_offset.ctypes.data_as(index_pointer),
+            source_length=source_length.ctypes.data_as(index_pointer),
+            source_pool=source_pool.ctypes.data_as(real_pointer),
+            n_receivers=len(self._receivers),
+            receiver_index=receiver_index.ctypes.data_as(index_pointer),
+            recording=recording.ctypes.data_as(real_pointer),
+            n_velocity=len(self._velocity_probes),
+            velocity_cell=velocity_cell.ctypes.data_as(index_pointer),
+            velocity_lower=velocity_lower.ctypes.data_as(index_pointer),
+            velocity_difference=velocity_difference.ctypes.data_as(real_pointer),
         )
         self._library.acfdtd_scalar_run(ctypes.byref(state))
         self.step_index += n_steps
         self._newest ^= n_steps & 1
+        if self._receivers:
+            self._recordings.append(recording)
+        if self._velocity_probes:
+            self._integrate_velocity(velocity_difference)
+
+    def _integrate_velocity(self, difference: np.ndarray) -> None:
+        """The reference's running sum ``v <- v - (dt / (rho dx)) d``, a chunk at a time.
+
+        Each sample is ``v`` before the step's increment, so the row is the cumulative sum of
+        ``[v, -c d_0, -c d_1, ...]`` without its last element, which is the new running value.
+        ``cumsum`` adds strictly left to right in fp64, and ``v - x`` equals ``v + (-x)`` exactly,
+        so this is the reference's sequence of roundings. A probe on a lower wall has ``d = 0``
+        and stays at zero.
+        """
+        n_steps = difference.shape[1]
+        terms = np.empty((difference.shape[0], n_steps + 1))
+        terms[:, 0] = self._velocity_running
+        terms[:, 1:] = -(self._vel_coef * difference.astype(np.float64))
+        sums = np.cumsum(terms, axis=1)
+        self._velocity_recordings.append(sums[:, :n_steps])
+        self._velocity_running = sums[:, n_steps].copy()
 
 
 class CScalarFDTD2D:

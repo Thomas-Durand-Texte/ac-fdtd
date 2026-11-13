@@ -232,6 +232,32 @@ typedef struct {
     const int64_t *wall_index;
     const REAL *wall_a;
     REAL *wall_scratch;
+
+    /* Soft volume sources, as ac_fdtd.scalar.ScalarFDTD._inject_sources: each adds
+     * src_coef * (S[n] - S[n-1]) to its cell of the new level, after the wall solve, in insertion
+     * order. The signals are concatenated in `source_pool`; source r owns
+     * [source_offset[r], source_offset[r] + source_length[r]), indexed by the global step. */
+    int64_t step_offset; /* the global step index of this chunk's first step */
+    REAL src_coef;       /* rho c^2 dt */
+    int64_t n_sources;
+    const int64_t *source_index;
+    const int64_t *source_offset;
+    const int64_t *source_length;
+    const REAL *source_pool;
+
+    /* Pressure receivers: the new level at each cell, after each step (rows of n_steps). */
+    int64_t n_receivers;
+    const int64_t *receiver_index;
+    REAL *recording;
+
+    /* Velocity receivers: only the face difference p[cell] - p[cell - e_axis] of the current level,
+     * taken before each step's update (rows of n_steps). The running sum the reference keeps in
+     * fp64 is done by the caller, per chunk; a probe on a lower wall has velocity_lower = -1 and
+     * records 0, its face being the wall. */
+    int64_t n_velocity;
+    const int64_t *velocity_cell;
+    const int64_t *velocity_lower;
+    REAL *velocity_difference;
 } acfdtd_scalar;
 
 size_t acfdtd_scalar_struct_size(void) { return sizeof(acfdtd_scalar); }
@@ -549,6 +575,15 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
     if (n_threads == 0) acfdtd_set_threads(0);
 
     for (int64_t step = 0; step < s->n_steps; step++) {
+        const int64_t absolute = s->step_offset + step;
+
+        /* Velocity probes read p^n, before the update replaces anything. */
+        for (int64_t r = 0; r < s->n_velocity; r++) {
+            const int64_t lower = s->velocity_lower[r];
+            s->velocity_difference[r * s->n_steps + step] =
+                (lower >= 0) ? s->current[s->velocity_cell[r]] - s->current[lower] : (REAL)0;
+        }
+
         if (s->n_wall) {
             /* Save p^{n-1} at the wall cells before the sweep overwrites `previous`. */
             for (int64_t w = 0; w < s->n_wall; w++)
@@ -558,9 +593,26 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
         } else {
             dispatch(s, wave_sweep, s->nx);
         }
+
+        /* Soft sources after the wall solve, so a source on a wall cell is not divided by 1 + a.
+         * The difference is formed in REAL first, as the reference forms it in its dtype, and a
+         * zero difference is skipped as it skips it. One step past the end injects -S[-1]. */
+        for (int64_t src = 0; src < s->n_sources; src++) {
+            const int64_t length = s->source_length[src];
+            if (absolute > length) continue;
+            const REAL *sig = s->source_pool + s->source_offset[src];
+            const REAL now = (absolute < length) ? sig[absolute] : (REAL)0;
+            const REAL prev = (absolute > 0) ? sig[absolute - 1] : (REAL)0;
+            const REAL delta = now - prev;
+            if (delta != 0) s->previous[s->source_index[src]] += s->src_coef * delta;
+        }
+
         REAL *swap = s->current;
         s->current = s->previous;
         s->previous = swap;
+
+        for (int64_t r = 0; r < s->n_receivers; r++)
+            s->recording[r * s->n_steps + step] = s->current[s->receiver_index[r]];
     }
 }
 
