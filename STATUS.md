@@ -54,10 +54,9 @@ and when; this file is the current picture and gets rewritten.
    receivers) has landed too — bit-identical to
    the reference, 1.8–2.5× the p–v C kernel. The 3D `CScalarFDTD` now has the locally-reacting
    walls (T001), volume sources + pressure/velocity receivers (T002) and rigid obstacles (T003,
-   `rigid_cells`), all bit-identical to `ScalarFDTD`. The CPML shell is in the 2D C kernel (T004,
-   `absorbing_boundary`, shell-only slabs, bit-identical). Still to do, in order: the **CPML shell
-   in the 3D C kernel**; then adapter + auto-selection in
-   the app. Air relaxation has landed in both NumPy references (T006: divergence rebuilt from the
+   `rigid_cells`), all bit-identical to `ScalarFDTD`. The CPML shell is in both C kernels (T004 2D,
+   T005 3D: `absorbing_boundary`, shell-only slabs, bit-identical). Still to do: adapter +
+   auto-selection in the app. Air relaxation has landed in both NumPy references (T006: divergence rebuilt from the
    two pressure levels, +1 array/process, equal to the p–v scheme with air to ~1e-14; not yet with
    the CPML shell or prescribed pressure sources, nor in C); the matched sponge does not port — the
    CPML is its pressure-only replacement.
