@@ -120,4 +120,7 @@ side, a shadow forms). The front end voxelises geometry (e.g. a Helmholtz resona
 The compiled 2D kernel takes the mask too (`CAcousticFDTD2D(rigid_cells=…)`): two extra 0/1-masking
 sweeps per step, skipped when there is none, parity-tested against the reference including an
 obstacle in an absorbing room (`tests/test_c_backend_2d.py`). Not yet: the mask on the 3D / Torch
-kernels, a 3D mask, or absorbing (non-rigid) masked surfaces.
+kernels or a 3D mask. Absorbing masked surfaces exist in 2D scalar form (T008:
+`ScalarFDTD2D(obstacle_admittance=…)`, ξ per solid cell, folded into the wall `a` terms; equal to an
+outer wall of the same ξ to 1e-12; T009: `CScalarFDTD2D` takes the same keyword, merged in Python
+into its wall table, bit-identical in fp64); `AcousticFDTD2D` does not take it yet.

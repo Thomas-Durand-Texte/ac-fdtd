@@ -120,6 +120,14 @@ class ScalarFDTD2D:
             and constants: one cell array per relaxation process, driven by a divergence rebuilt
             from the two pressure levels (see :meth:`_relaxed_update`), so no velocity grid. Not
             combinable with ``absorbing_boundary``: the CPML shell has no relaxation states.
+        obstacle_admittance: Normalised admittance xi = rho c Y of each solid cell, grid shape
+            (requires ``rigid_cells``). Read only at solid cells — fluid values are ignored,
+            whatever they are. A solid's xi applies to each of its faces that borders a fluid cell,
+            as a locally-reacting surface ``v.n = xi p``: the fluid cell behind it gains the outer
+            walls' three-level term, ``a`` summed over its absorbing faces and any outer wall it
+            touches. Faces between two solids never count. ``None`` (or all zero) keeps every
+            solid rigid, bit-identical to the plain mask. Like the outer walls, ignored inside a
+            CPML shell.
     """
 
     def __init__(
@@ -132,6 +140,7 @@ class ScalarFDTD2D:
         rigid_cells: np.ndarray | None = None,
         absorbing_boundary: AbsorbingBoundary2D | None = None,
         air_absorption: AirAbsorption | None = None,
+        obstacle_admittance: np.ndarray | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -177,6 +186,13 @@ class ScalarFDTD2D:
             self._rigid_cells = rigid
             self._x_open = (~(rigid[:-1, :] | rigid[1:, :])).astype(self.dtype)
             self._y_open = (~(rigid[:, :-1] | rigid[:, 1:])).astype(self.dtype)
+
+        if obstacle_admittance is not None:
+            if self._rigid_cells is None:
+                raise ValueError(
+                    "obstacle_admittance needs rigid_cells: it is read only at solid cells"
+                )
+            self._merge_obstacle_admittance(obstacle_admittance)
 
         # CFS-CPML open boundary (optional). Builds the hybrid: a p-v + CPML shell around the scalar
         # interior. Velocity and the four memory variables live on the full grid here for a readable
@@ -228,6 +244,51 @@ class ScalarFDTD2D:
         # Driven velocity faces, keyed by (axis, cell whose lower face it is). Insertion order is
         # the order the corrections are applied in, so the compiled kernel can follow it exactly.
         self._faces: dict[tuple[int, tuple[int, int]], _VelocityFace] = {}
+
+    def _merge_obstacle_admittance(self, obstacle_admittance: np.ndarray) -> None:
+        """Fold the absorbing obstacle faces into the sparse wall arrays.
+
+        An exposed absorbing face is the outer wall's case seen from the fluid cell behind it, so
+        it joins ``_wall_indices`` / ``_wall_a``: the impedance-wall correction, the air-absorption
+        update and the driven velocity faces then pick it up with no separate code path. Runs
+        before ``_setup_cpml``, which drops the cells of the shell as it does for the outer walls.
+        """
+        grid = self.grid
+        rigid = self._rigid_cells
+        assert rigid is not None
+        xi = np.asarray(obstacle_admittance, dtype=np.float64)
+        if xi.shape != grid.shape:
+            raise ValueError(
+                f"obstacle_admittance shape {xi.shape} does not match the grid {grid.shape}"
+            )
+        solid_xi = xi[rigid]
+        if not np.all(np.isfinite(solid_xi)) or np.any(solid_xi < 0.0):
+            raise ValueError("obstacle_admittance must be finite and >= 0 at every solid cell")
+
+        # Sum xi over each fluid cell's solid 4-neighbours; zero elsewhere, so a face between two
+        # solids (the sum lands on a solid) and fluid-cell values (masked out first) never count.
+        weight = np.where(rigid, xi, 0.0)
+        total = np.zeros(grid.shape)
+        total[:-1, :] += weight[1:, :]
+        total[1:, :] += weight[:-1, :]
+        total[:, :-1] += weight[:, 1:]
+        total[:, 1:] += weight[:, :-1]
+        total[rigid] = 0.0
+        flat = np.flatnonzero(total.reshape(-1) > 0.0)
+        if not flat.size:
+            return  # all rigid: leave the wall arrays untouched, so the run is bit-identical
+
+        # a = (c dt / 2 dx) * sum xi in float64, as wall_update_coefficients_2d builds it. Cells
+        # also on the outer-wall ring add to their existing (float64) wall term; the other wall
+        # cells keep exactly the coefficient they had, so nothing changes where no solid absorbs.
+        scale = self.medium.sound_speed * self.dt / (2.0 * grid.dx)
+        dense = np.zeros(total.size)
+        _, wall_a = wall_update_coefficients_2d(grid, self.medium, self.dt, self.walls)
+        dense[self._wall_indices] = wall_a
+        dense[flat] += scale * total.reshape(-1)[flat]
+        indices = np.union1d(self._wall_indices, flat)
+        self._wall_indices = indices
+        self._wall_a = dense[indices].astype(self.dtype)
 
     def _setup_cpml(self, boundary: AbsorbingBoundary2D) -> None:
         grid = self.grid

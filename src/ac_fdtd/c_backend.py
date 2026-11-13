@@ -1277,10 +1277,12 @@ class CScalarFDTD2D:
     Two cell arrays instead of three, one sweep instead of two: the fast, low-memory path for a
     closed 2D room. It is the same scheme as :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`, not an
     approximation — bit-identical to :class:`~ac_fdtd.scalar2d.ScalarFDTD2D` — with rigid and
-    locally-reacting walls, rigid obstacles, soft volume sources, prescribed pressure and velocity
-    sources, pressure receivers, and the CFS-CPML open boundary (``absorbing_boundary``, the shell
-    of :mod:`ac_fdtd.cpml2d`). The matched layer, air absorption and velocity receivers are not
-    compiled here; the NumPy reference carries those.
+    locally-reacting walls, rigid obstacles, absorbing obstacles (``obstacle_admittance``: the
+    normalised admittance of each solid cell, folded into the wall table so it combines with the
+    walls, the rigid cells and the CPML shell), soft volume sources, prescribed pressure and
+    velocity sources, pressure receivers, and the CFS-CPML open boundary (``absorbing_boundary``,
+    the shell of :mod:`ac_fdtd.cpml2d`). The matched layer, air absorption and velocity receivers
+    are not compiled here; the NumPy reference carries those.
 
     With an absorbing boundary the interior still holds two arrays: the shell's velocity and memory
     fields are stored per lined wall, as slabs of the shell's own depth, never as grid-sized fields.
@@ -1298,6 +1300,7 @@ class CScalarFDTD2D:
         walls: WallAdmittances2D | None = None,
         rigid_cells: np.ndarray | None = None,
         absorbing_boundary: AbsorbingBoundary2D | None = None,
+        obstacle_admittance: np.ndarray | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -1337,16 +1340,6 @@ class CScalarFDTD2D:
         self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
         self._wall_a = coefficient.astype(self.dtype)
 
-        self._shell: np.ndarray | None = None
-        self._cpml_region = np.zeros(0, dtype=np.int64)
-        self._cpml_units = (0, 0)
-        self._cpml_constants = (0.0, 0.0, 0.0)
-        self._cpml_profiles: list[np.ndarray] = []
-        self._cpml_fields: list[np.ndarray] = []
-        if absorbing_boundary is not None:
-            self._setup_cpml(absorbing_boundary)
-        self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
-
         self._has_rigid = rigid_cells is not None
         self._rigid: np.ndarray | None = None
         if rigid_cells is None:
@@ -1368,6 +1361,23 @@ class CScalarFDTD2D:
             )
             self._p_keep = np.ascontiguousarray((~rigid).astype(self.dtype).reshape(-1))
 
+        if obstacle_admittance is not None:
+            if rigid_cells is None:
+                raise ValueError(
+                    "obstacle_admittance needs rigid_cells: it is read only at solid cells"
+                )
+            self._merge_obstacle_admittance(obstacle_admittance)
+
+        self._shell: np.ndarray | None = None
+        self._cpml_region = np.zeros(0, dtype=np.int64)
+        self._cpml_units = (0, 0)
+        self._cpml_constants = (0.0, 0.0, 0.0)
+        self._cpml_profiles: list[np.ndarray] = []
+        self._cpml_fields: list[np.ndarray] = []
+        if absorbing_boundary is not None:
+            self._setup_cpml(absorbing_boundary)
+        self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
+
         self._sources: list[tuple[tuple[int, int], np.ndarray]] = []
         self._receivers: list[tuple[int, int]] = []
         self._recordings: list[np.ndarray] = []
@@ -1384,6 +1394,47 @@ class CScalarFDTD2D:
         self._face_a_lowers: list[float] = []
         self._face_closed: list[int] = []
         self._face_value = np.zeros(0, dtype=self.dtype)
+
+    def _merge_obstacle_admittance(self, obstacle_admittance: np.ndarray) -> None:
+        """Fold the absorbing obstacle faces into the wall table, as ``ScalarFDTD2D`` does.
+
+        Each fluid cell next to solid cells gets ``a = (c dt / 2 dx) * sum(xi)`` in float64, added
+        to its outer-wall coefficient if it has one; the table is cast to ``dtype`` only at the
+        end. Runs before ``_setup_cpml`` so the shell filter sees the merged table.
+        """
+        grid = self.grid
+        rigid = self._rigid
+        assert rigid is not None
+        xi = np.asarray(obstacle_admittance, dtype=np.float64)
+        if xi.shape != grid.shape:
+            raise ValueError(
+                f"obstacle_admittance shape {xi.shape} does not match the grid {grid.shape}"
+            )
+        solid_xi = xi[rigid]
+        if not np.all(np.isfinite(solid_xi)) or np.any(solid_xi < 0.0):
+            raise ValueError("obstacle_admittance must be finite and >= 0 at every solid cell")
+
+        # Fluid-cell values are masked out first and solid-solid faces land on solid cells, which
+        # are zeroed, so neither ever counts.
+        weight = np.where(rigid, xi, 0.0)
+        total = np.zeros(grid.shape)
+        total[:-1, :] += weight[1:, :]
+        total[1:, :] += weight[:-1, :]
+        total[:, :-1] += weight[:, 1:]
+        total[:, 1:] += weight[:, :-1]
+        total[rigid] = 0.0
+        flat = np.flatnonzero(total.reshape(-1) > 0.0)
+        if not flat.size:
+            return  # nothing absorbs: leave the wall arrays untouched
+
+        scale = self.medium.sound_speed * self.dt / (2.0 * grid.dx)
+        dense = np.zeros(total.size)
+        indices, wall_a = wall_update_coefficients_2d(grid, self.medium, self.dt, self.walls)
+        dense[indices] = wall_a
+        dense[flat] += scale * total.reshape(-1)[flat]
+        merged = np.union1d(indices, flat)
+        self._wall_index = np.ascontiguousarray(merged, dtype=np.int64)
+        self._wall_a = dense[merged].astype(self.dtype)
 
     @property
     def p(self) -> np.ndarray:
