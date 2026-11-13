@@ -917,8 +917,9 @@ void acfdtd2d_run(acfdtd2d *s, int64_t step_offset) {
  * AcousticFDTD2D to the last bit -- and it mirrors ac_fdtd.scalar2d.ScalarFDTD2D: a Neumann
  * (mirrored-ghost) Laplacian for rigid walls, closed faces next to a solid cell for obstacles, and
  * the three-level locally-reacting wall relation (1+a) p^{n+1} = 2 p^n - (1-a) p^{n-1} + lam^2 L_N,
- * applied as a post-pass on the wall cells. Open boundaries (the CFS-CPML shell) are not here yet;
- * this kernel is the fast path for a closed room. */
+ * applied as a post-pass on the wall cells. An open boundary is the CFS-CPML shell of
+ * ac_fdtd.cpml2d: a p-v + CPML update on the shell cells that overwrites the scalar update there,
+ * with its velocity and memory fields stored in the shell only (see cpml_velocity_2d). */
 typedef struct {
     int32_t nx, ny;
     int64_t n_wall;
@@ -975,7 +976,49 @@ typedef struct {
     const int64_t *window_length;
     const int64_t *window_offset;
     const REAL *window_pool;
+
+    /* The CFS-CPML shell, as ac_fdtd.scalar2d._apply_cpml computes it; n_cpml_regions is 0 without
+     * one. The shell is cut into disjoint rectangles, one per lined wall (the x slabs take the
+     * corners), and each region stores its own cells and every face bordering them: psi_px,
+     * psi_py on (i1-i0)*(j1-j0) cells, vx and psi_vx on (i1-i0+1)*(j1-j0) faces, vy and psi_vy on
+     * (i1-i0)*(j1-j0+1) faces, row-major with y contiguous, at the offsets in cpml_region. A face
+     * on the border between two regions is therefore stored twice; both copies see the same
+     * pressure and the same profiles, so they stay equal to the last bit, and no region ever
+     * reads another's storage -- which is what lets the regions run without any synchronisation
+     * beyond the one barrier between the face sweep and the cell sweep. The domain's own wall
+     * lines (face 0 and face n) are never updated and stay at zero, as in the reference. Units
+     * are the dispatch extents: one velocity unit per face row, one pressure unit per cell row. */
+    int64_t n_cpml_regions;
+    const int64_t *cpml_region; /* CPML_COLUMNS entries per region, see the enum below */
+    int32_t cpml_velocity_units;
+    int32_t cpml_pressure_units;
+    REAL inverse_dx; /* 1/dx: the CPML gradients carry it explicitly */
+    REAL cpml_cv;    /* dt / rho */
+    REAL cpml_cp;    /* rho c^2 dt */
+    /* Profiles from cpml_axis_profiles: _p at cell centres (n), _v at faces (n + 1). */
+    const REAL *kx_p, *bx_p, *ax_p;
+    const REAL *ky_p, *by_p, *ay_p;
+    const REAL *kx_v, *bx_v, *ax_v;
+    const REAL *ky_v, *by_v, *ay_v;
+    REAL *vx, *psi_vx;
+    REAL *vy, *psi_vy;
+    REAL *psi_px, *psi_py;
 } acfdtd2d_scalar;
+
+/* Columns of one row of cpml_region: the rectangle [i0, i1) x [j0, j1), the region's offsets into
+ * the cell, x-face and y-face pools, and the first velocity and pressure unit it owns. */
+enum {
+    CPML_I0,
+    CPML_I1,
+    CPML_J0,
+    CPML_J1,
+    CPML_CELLS,
+    CPML_XFACES,
+    CPML_YFACES,
+    CPML_VUNIT,
+    CPML_PUNIT,
+    CPML_COLUMNS
+};
 
 size_t acfdtd2d_scalar_struct_size(void) { return sizeof(acfdtd2d_scalar); }
 
@@ -1090,6 +1133,108 @@ static void update_velocity_faces_2d(acfdtd2d_scalar *s, int64_t absolute) {
     }
 }
 
+/* The region a dispatch unit belongs to: there are at most four, so a scan is as fast as any
+ * lookup. `column` is CPML_VUNIT or CPML_PUNIT; `rows_extra` is 1 for face rows (one more than
+ * cell rows), 0 for cell rows. */
+static const int64_t *cpml_region_of(const acfdtd2d_scalar *s, int32_t unit, int column,
+                                     int rows_extra) {
+    for (int64_t k = 0; k < s->n_cpml_regions; k++) {
+        const int64_t *region = s->cpml_region + k * CPML_COLUMNS;
+        const int64_t rows = region[CPML_I1] - region[CPML_I0] + rows_extra;
+        if (unit >= region[column] && unit < region[column] + rows) return region;
+    }
+    return NULL;
+}
+
+/* The CPML velocity step of ac_fdtd.scalar2d._apply_cpml, one face row per unit: the x faces of
+ * row i0 + r and, while r is a cell row, the y faces of that cell row. Per face, in the
+ * reference's operation order:
+ *     g = (p_upper - p_lower) * (1/dx)
+ *     psi = b psi + a g
+ *     v = v - cv (g / kappa + psi)
+ * reading only p^n (`current`), so every face is independent of every other. */
+static void cpml_velocity_2d(const acfdtd2d_scalar *s, int32_t start, int32_t end) {
+    const int32_t nx = s->nx, ny = s->ny;
+    const REAL inverse_dx = s->inverse_dx, cv = s->cpml_cv;
+    const REAL *cur = s->current;
+    for (int32_t unit = start; unit < end; unit++) {
+        const int64_t *region = cpml_region_of(s, unit, CPML_VUNIT, 1);
+        const int64_t i0 = region[CPML_I0], i1 = region[CPML_I1];
+        const int64_t j0 = region[CPML_J0], j1 = region[CPML_J1];
+        const int64_t nj = j1 - j0;
+        const int64_t r = unit - region[CPML_VUNIT];
+
+        const int64_t fi = i0 + r; /* x face between cells fi - 1 and fi */
+        if (fi > 0 && fi < nx) {
+            REAL *v = s->vx + region[CPML_XFACES] + r * nj;
+            REAL *psi = s->psi_vx + region[CPML_XFACES] + r * nj;
+            const REAL b = s->bx_v[fi], a = s->ax_v[fi], kappa = s->kx_v[fi];
+            for (int64_t c = 0; c < nj; c++) {
+                const int64_t here = fi * ny + j0 + c;
+                const REAL g = (cur[here] - cur[here - ny]) * inverse_dx;
+                psi[c] = b * psi[c] + a * g;
+                v[c] = v[c] - cv * (g / kappa + psi[c]);
+            }
+        }
+
+        if (r < i1 - i0) {
+            const int64_t i = i0 + r;
+            REAL *v = s->vy + region[CPML_YFACES] + r * (nj + 1);
+            REAL *psi = s->psi_vy + region[CPML_YFACES] + r * (nj + 1);
+            for (int64_t c = 0; c <= nj; c++) {
+                const int64_t fj = j0 + c; /* y face between cells fj - 1 and fj */
+                if (fj <= 0 || fj >= ny) continue;
+                const int64_t here = i * ny + fj;
+                const REAL g = (cur[here] - cur[here - 1]) * inverse_dx;
+                psi[c] = s->by_v[fj] * psi[c] + s->ay_v[fj] * g;
+                v[c] = v[c] - cv * (g / s->ky_v[fj] + psi[c]);
+            }
+        }
+    }
+}
+
+/* The CPML pressure step, one cell row per unit, overwriting p^{n+1} (`previous`) on the shell:
+ *     d_x = (vx_upper - vx_lower) * (1/dx),   psi_px = b psi_px + a d_x     (same on y)
+ *     p^{n+1} = p^n - cp (d_x / kappa_x + psi_px + d_y / kappa_y + psi_py)
+ * summed left to right, as NumPy does. Reads only this region's faces, written by the previous
+ * sweep. */
+static void cpml_pressure_2d(const acfdtd2d_scalar *s, int32_t start, int32_t end) {
+    const int32_t ny = s->ny;
+    const REAL inverse_dx = s->inverse_dx, cp = s->cpml_cp;
+    const REAL *cur = s->current;
+    REAL *out = s->previous;
+    for (int32_t unit = start; unit < end; unit++) {
+        const int64_t *region = cpml_region_of(s, unit, CPML_PUNIT, 0);
+        const int64_t j0 = region[CPML_J0], nj = region[CPML_J1] - j0;
+        const int64_t r = unit - region[CPML_PUNIT];
+        const int64_t i = region[CPML_I0] + r;
+
+        const REAL *vx_lower = s->vx + region[CPML_XFACES] + r * nj;
+        const REAL *vx_upper = vx_lower + nj;
+        const REAL *vy = s->vy + region[CPML_YFACES] + r * (nj + 1);
+        REAL *psi_x = s->psi_px + region[CPML_CELLS] + r * nj;
+        REAL *psi_y = s->psi_py + region[CPML_CELLS] + r * nj;
+        const REAL bx = s->bx_p[i], ax = s->ax_p[i], kx = s->kx_p[i];
+        for (int64_t c = 0; c < nj; c++) {
+            const int64_t j = j0 + c;
+            const REAL divergence_x = (vx_upper[c] - vx_lower[c]) * inverse_dx;
+            psi_x[c] = bx * psi_x[c] + ax * divergence_x;
+            const REAL divergence_y = (vy[c + 1] - vy[c]) * inverse_dx;
+            psi_y[c] = s->by_p[j] * psi_y[c] + s->ay_p[j] * divergence_y;
+            const int64_t cell = (int64_t)i * ny + j;
+            out[cell] = cur[cell] - cp * (divergence_x / kx + psi_x[c] + divergence_y / s->ky_p[j] +
+                                          psi_y[c]);
+        }
+    }
+}
+
+static void cpml_velocity_dispatch_2d(const void *state, int32_t start, int32_t end) {
+    cpml_velocity_2d((const acfdtd2d_scalar *)state, start, end);
+}
+static void cpml_pressure_dispatch_2d(const void *state, int32_t start, int32_t end) {
+    cpml_pressure_2d((const acfdtd2d_scalar *)state, start, end);
+}
+
 /* Prescribed pressure windows, as ac_fdtd.scalar2d._apply_prescribed_pressure: after the volume
  * sources, in insertion order, the node is set to the sample while its window is active. */
 static void apply_prescribed_pressure_scalar_2d(acfdtd2d_scalar *s, int64_t absolute) {
@@ -1113,6 +1258,14 @@ void acfdtd2d_scalar_run(acfdtd2d_scalar *s, int64_t step_offset) {
         dispatch(s, scalar_sweep_2d_dispatch, s->nx);
         finish_scalar_walls_2d(s);
         update_velocity_faces_2d(s, absolute);
+
+        /* The CPML shell overwrites the scalar update on its cells, after the walls (which never
+         * reach a shell cell) and the driven faces (refused next to the shell), before the
+         * sources: the reference's order. Faces first, then cells, a barrier between. */
+        if (s->n_cpml_regions) {
+            dispatch(s, cpml_velocity_dispatch_2d, s->cpml_velocity_units);
+            dispatch(s, cpml_pressure_dispatch_2d, s->cpml_pressure_units);
+        }
 
         /* Soft volume sources: the DIFFERENCE S_n - S_{n-1} (the eliminated divergence carries the
          * previous sample). Written into the new level, matching the reference's order. The rows

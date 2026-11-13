@@ -36,6 +36,7 @@ from .boundaries2d import (
     layer_factors_2d,
     wall_update_coefficients_2d,
 )
+from .cpml2d import AbsorbingBoundary2D, cpml_axis_profiles
 from .grid import Grid, max_stable_time_step
 from .grid2d import Grid2D, max_stable_time_step_2d
 from .medium import AIR, Medium
@@ -322,9 +323,29 @@ def _scalar_structure_2d(dtype: np.dtype) -> type[ctypes.Structure]:
             ("window_length", index_pointer),
             ("window_offset", index_pointer),
             ("window_pool", pointer),
+            ("n_cpml_regions", ctypes.c_int64),
+            ("cpml_region", index_pointer),
+            ("cpml_velocity_units", ctypes.c_int32),
+            ("cpml_pressure_units", ctypes.c_int32),
+            ("inverse_dx", real),
+            ("cpml_cv", real),
+            ("cpml_cp", real),
+            *((name, pointer) for name in _CPML_PROFILE_NAMES),
+            *((name, pointer) for name in _CPML_FIELD_NAMES),
         ]
 
     return ScalarState2D
+
+
+# The CPML arrays of the 2D scalar struct, in struct order. Profiles: (kappa, b, a) at cell centres
+# then at faces, x before y. Fields: the per-region pools of the shell state.
+_CPML_PROFILE_NAMES = (
+    "kx_p", "bx_p", "ax_p", "ky_p", "by_p", "ay_p",
+    "kx_v", "bx_v", "ax_v", "ky_v", "by_v", "ay_v",
+)  # fmt: skip
+_CPML_FIELD_NAMES = ("vx", "psi_vx", "vy", "psi_vy", "psi_px", "psi_py")
+# Columns of one row of the region table; must match the CPML_* enum of the C file.
+_CPML_COLUMNS = 9
 
 
 class CAcousticFDTD:
@@ -1120,8 +1141,12 @@ class CScalarFDTD2D:
     closed 2D room. It is the same scheme as :class:`~ac_fdtd.scheme2d.AcousticFDTD2D`, not an
     approximation — bit-identical to :class:`~ac_fdtd.scalar2d.ScalarFDTD2D` — with rigid and
     locally-reacting walls, rigid obstacles, soft volume sources, prescribed pressure and velocity
-    sources, and pressure receivers. Open boundaries (the CFS-CPML shell), the matched layer and
-    velocity receivers are not compiled here yet; the NumPy reference carries those.
+    sources, pressure receivers, and the CFS-CPML open boundary (``absorbing_boundary``, the shell
+    of :mod:`ac_fdtd.cpml2d`). The matched layer, air absorption and velocity receivers are not
+    compiled here; the NumPy reference carries those.
+
+    With an absorbing boundary the interior still holds two arrays: the shell's velocity and memory
+    fields are stored per lined wall, as slabs of the shell's own depth, never as grid-sized fields.
 
     As with the other compiled kernels :meth:`run` is the unit of work, and the two pressure levels
     are ordinary NumPy arrays C writes into.
@@ -1135,6 +1160,7 @@ class CScalarFDTD2D:
         dtype: np.dtype = np.float64,
         walls: WallAdmittances2D | None = None,
         rigid_cells: np.ndarray | None = None,
+        absorbing_boundary: AbsorbingBoundary2D | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -1146,6 +1172,7 @@ class CScalarFDTD2D:
         self.walls = walls or WallAdmittances2D()
         self.dt = courant * max_stable_time_step_2d(grid.dx, medium.sound_speed)
         self.step_index = 0
+        self.absorbing_boundary = absorbing_boundary
 
         self._library = _library(self.dtype)
         self._state_type = _scalar_structure_2d(self.dtype)
@@ -1172,6 +1199,15 @@ class CScalarFDTD2D:
         indices, coefficient = wall_update_coefficients_2d(grid, medium, self.dt, self.walls)
         self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
         self._wall_a = coefficient.astype(self.dtype)
+
+        self._shell: np.ndarray | None = None
+        self._cpml_region = np.zeros(0, dtype=np.int64)
+        self._cpml_units = (0, 0)
+        self._cpml_constants = (0.0, 0.0, 0.0)
+        self._cpml_profiles: list[np.ndarray] = []
+        self._cpml_fields: list[np.ndarray] = []
+        if absorbing_boundary is not None:
+            self._setup_cpml(absorbing_boundary)
         self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
 
         self._has_rigid = rigid_cells is not None
@@ -1269,6 +1305,14 @@ class CScalarFDTD2D:
         elif kind == "velocity":
             if axis not in (0, 1):
                 raise ValueError(f"velocity source needs axis in (0, 1), got {axis!r}")
+            if self._shell is not None:
+                below = list(cell)
+                below[axis] -= 1
+                if self._in_shell(cell) or (cell[axis] > 0 and self._in_shell(tuple(below))):
+                    raise ValueError(
+                        "a velocity source on a face bordering the absorbing shell is not "
+                        "supported (no reference has a CPML plus a driven face)"
+                    )
             self._windows.append((0, self._face(axis, cell), start, samples))
         else:
             raise ValueError(f"kind must be 'pressure' or 'velocity', got {kind!r}")
@@ -1312,6 +1356,87 @@ class CScalarFDTD2D:
         self._face_closed.append(int(closed))
         self._face_value = np.append(self._face_value, self.dtype.type(0.0))
         return index
+
+    def _setup_cpml(self, boundary: AbsorbingBoundary2D) -> None:
+        """The shell of ``ScalarFDTD2D._setup_cpml``, cut into one slab per lined wall.
+
+        The reference keeps the shell state on full-grid arrays and masks its updates; here each
+        lined wall gets a rectangle of the shell (the x slabs run the full height and take the
+        corners, the y slabs fill between them), so the rectangles are disjoint and cover exactly
+        the shell. Each stores its cells and every face bordering them; the C file explains why a
+        face shared by two slabs is stored twice. Profiles and constants are cast as the reference
+        casts them, so the kernel multiplies the same rounded numbers.
+        """
+        grid = self.grid
+        nx, ny = grid.shape
+        thickness = boundary.thickness
+        if 2 * thickness >= min(nx, ny):
+            raise ValueError(
+                f"absorbing layer of {thickness} cells does not fit a {grid.shape} grid"
+            )
+
+        profiles = cpml_axis_profiles(grid, self.medium, self.dt, boundary)
+        self._cpml_profiles = [
+            np.ascontiguousarray(c, dtype=self.dtype)
+            for key in (("p", 0), ("p", 1), ("v", 0), ("v", 1))
+            for c in profiles[key]
+        ]
+        cast = self.dtype.type
+        self._cpml_constants = (
+            cast(1.0 / grid.dx),
+            cast(self.dt / self.medium.density),
+            cast(self.medium.density * self.medium.sound_speed**2 * self.dt),
+        )
+
+        low_x, high_x = boundary.has_axis(0)
+        low_y, high_y = boundary.has_axis(1)
+        x_start = thickness if low_x else 0
+        x_end = nx - thickness if high_x else nx
+        rectangles = []
+        if low_x:
+            rectangles.append((0, thickness, 0, ny))
+        if high_x:
+            rectangles.append((nx - thickness, nx, 0, ny))
+        if low_y:
+            rectangles.append((x_start, x_end, 0, thickness))
+        if high_y:
+            rectangles.append((x_start, x_end, ny - thickness, ny))
+
+        # One row per region: bounds, pool offsets (cells, x faces, y faces), first units.
+        rows = []
+        cells = x_faces = y_faces = velocity_units = pressure_units = 0
+        shell = []
+        for i0, i1, j0, j1 in rectangles:
+            rows.append((i0, i1, j0, j1, cells, x_faces, y_faces, velocity_units, pressure_units))
+            ni, nj = i1 - i0, j1 - j0
+            cells += ni * nj
+            x_faces += (ni + 1) * nj
+            y_faces += ni * (nj + 1)
+            velocity_units += ni + 1
+            pressure_units += ni
+            shell.append((np.arange(i0, i1)[:, None] * ny + np.arange(j0, j1)[None, :]).ravel())
+        self._cpml_region = np.array(rows, dtype=np.int64).reshape(-1)
+        self._cpml_units = (velocity_units, pressure_units)
+        # vx, psi_vx, vy, psi_vy, psi_px, psi_py: the state that persists across run calls.
+        self._cpml_fields = [
+            np.zeros(size, dtype=self.dtype)
+            for size in (x_faces, x_faces, y_faces, y_faces, cells, cells)
+        ]
+
+        # The shell's flat cell indices, sorted: a grid-sized mask is what this class avoids.
+        self._shell = np.sort(np.concatenate(shell))
+
+        # As in the reference: an impedance wall correction only applies to interior wall cells,
+        # and the driven-face wall coefficients are then read from the filtered table too.
+        if self._wall_index.size:
+            keep = ~np.isin(self._wall_index, self._shell)
+            self._wall_index = np.ascontiguousarray(self._wall_index[keep])
+            self._wall_a = self._wall_a[keep]
+
+    def _in_shell(self, cell: tuple[int, int]) -> bool:
+        flat = cell[0] * self.grid.ny + cell[1]
+        index = int(np.searchsorted(self._shell, flat))
+        return index < self._shell.size and int(self._shell[index]) == flat
 
     def _wall_coefficient(self, flat: int) -> float:
         hits = np.flatnonzero(self._wall_index == flat)
@@ -1418,7 +1543,20 @@ class CScalarFDTD2D:
             window_length=window_length.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             window_offset=window_offset.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             window_pool=window_pool.ctypes.data_as(ctypes.POINTER(real)),
+            n_cpml_regions=self._cpml_region.size // _CPML_COLUMNS,
+            cpml_region=self._cpml_region.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+            cpml_velocity_units=self._cpml_units[0],
+            cpml_pressure_units=self._cpml_units[1],
+            inverse_dx=self._cpml_constants[0],
+            cpml_cv=self._cpml_constants[1],
+            cpml_cp=self._cpml_constants[2],
         )
+        # The shell arrays, set by name; left NULL without a shell (n_cpml_regions is then 0). The
+        # field pools are written in place, so the shell state carries into the next run.
+        for name, array in zip(_CPML_PROFILE_NAMES, self._cpml_profiles, strict=False):
+            setattr(state, name, array.ctypes.data_as(ctypes.POINTER(real)))
+        for name, array in zip(_CPML_FIELD_NAMES, self._cpml_fields, strict=False):
+            setattr(state, name, array.ctypes.data_as(ctypes.POINTER(real)))
         self._library.acfdtd2d_scalar_run(ctypes.byref(state), ctypes.c_int64(self.step_index))
         self._face_value = face_value
         self.step_index += n_steps

@@ -100,6 +100,11 @@ class Grid2D:
         return self.nx * self.ny
 
     @property
+    def size(self) -> int:
+        """:attr:`n_cells` under NumPy's name, so a grid compares directly with an array's size."""
+        return self.n_cells
+
+    @property
     def lengths(self) -> tuple[float, float]:
         """Dimensions of the domain actually simulated, in metres."""
         return (self.nx * self.dx, self.ny * self.dx)
