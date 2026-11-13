@@ -1424,7 +1424,8 @@ class CScalarFDTD2D:
         ]
 
         # The shell's flat cell indices, sorted: a grid-sized mask is what this class avoids.
-        self._shell = np.sort(np.concatenate(shell))
+        # ``faces=()`` is a valid (empty) shell, as in the reference.
+        self._shell = np.sort(np.concatenate(shell)) if shell else np.zeros(0, dtype=np.int64)
 
         # As in the reference: an impedance wall correction only applies to interior wall cells,
         # and the driven-face wall coefficients are then read from the filtered table too.
