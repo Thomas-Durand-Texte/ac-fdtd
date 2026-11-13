@@ -225,9 +225,9 @@ typedef struct {
     REAL *previous;
 
     /* Locally-reacting walls. When n_wall is 0 the room is rigid and the fast sweep runs (unless
-     * there are obstacles); any wall at all switches to the exact sweep below. wall_a is a = c dt xi / (2 dx), already summed at
-     * edges and corners; wall_scratch holds p^{n-1} at the wall cells, saved before the sweep
-     * overwrites `previous`. */
+     * there are obstacles); any wall at all switches to the exact sweep below. wall_a is
+     * a = c dt xi / (2 dx), already summed at edges and corners; wall_scratch holds p^{n-1} at the
+     * wall cells, saved before the sweep overwrites `previous`. */
     int64_t n_wall;
     const int64_t *wall_index;
     const REAL *wall_a;
