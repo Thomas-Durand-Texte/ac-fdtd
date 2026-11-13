@@ -264,6 +264,11 @@ def _scalar_structure(dtype: np.dtype) -> type[ctypes.Structure]:
             ("velocity_cell", ctypes.POINTER(ctypes.c_int64)),
             ("velocity_lower", ctypes.POINTER(ctypes.c_int64)),
             ("velocity_difference", ctypes.POINTER(real)),
+            ("x_open", ctypes.POINTER(real)),
+            ("y_open", ctypes.POINTER(real)),
+            ("z_open", ctypes.POINTER(real)),
+            ("p_keep", ctypes.POINTER(real)),
+            ("has_rigid", ctypes.c_int32),
         ]
 
     return ScalarState
@@ -860,7 +865,10 @@ class CScalarFDTD:
     Rigid and locally-reacting walls (``walls``, as in :class:`~ac_fdtd.scalar.ScalarFDTD`). With
     any absorbing wall the kernel evaluates the reference's arithmetic in the reference's order, so
     it is bit-identical to ``ScalarFDTD`` in fp64; the all-rigid room keeps a faster sweep that
-    agrees to round-off. The absorbing layer and the relaxation states are not compiled here.
+    agrees to round-off. Rigid obstacles (``rigid_cells``) close every face touching a solid cell
+    and zero the solid cells after each step, as the reference does; a mask with any solid cell
+    selects the exact sweep, so it is bit-identical too, all-rigid room included. The absorbing
+    layer and the relaxation states are not compiled here.
 
     Soft volume sources and pressure and velocity receivers follow the reference too, with the same
     signatures. Their tables are handed to C once per :meth:`run` chunk and the recordings of
@@ -874,6 +882,7 @@ class CScalarFDTD:
         courant: float = 1.0,
         dtype: np.dtype = np.float64,
         walls: WallAdmittances | None = None,
+        rigid_cells: np.ndarray | None = None,
     ) -> None:
         if not 0.0 < courant <= 1.0:
             raise ValueError(f"courant must be in (0, 1], got {courant}")
@@ -908,6 +917,31 @@ class CScalarFDTD:
         self._wall_index = np.ascontiguousarray(indices, dtype=np.int64)
         self._wall_a = coefficient.astype(self.dtype)
         self._wall_scratch = np.zeros(self._wall_index.size, dtype=self.dtype)
+
+        # Rigid obstacles as the reference builds them: per axis, a face is open iff neither of its
+        # cells is solid, as 0/1 in the working dtype the C Laplacian multiplies by. A mask with no
+        # solid cell is no mask (multiplying by 1 changes nothing), which keeps the fast rigid sweep
+        # for it; the one-element placeholders only keep the struct pointers valid.
+        placeholder = np.ones(1, dtype=self.dtype)
+        self._open = [placeholder, placeholder, placeholder]
+        self._p_keep = placeholder
+        self._has_rigid = False
+        if rigid_cells is not None:
+            rigid = np.ascontiguousarray(rigid_cells, dtype=bool)
+            if rigid.shape != grid.shape:
+                raise ValueError(
+                    f"rigid_cells shape {rigid.shape} does not match the grid {grid.shape}"
+                )
+            if rigid.any():
+                self._has_rigid = True
+                self._open = []
+                for axis in range(3):
+                    lower = tuple(slice(None, -1) if a == axis else slice(None) for a in range(3))
+                    upper = tuple(slice(1, None) if a == axis else slice(None) for a in range(3))
+                    self._open.append(
+                        np.ascontiguousarray(~(rigid[lower] | rigid[upper]), dtype=self.dtype)
+                    )
+                self._p_keep = np.ascontiguousarray(~rigid, dtype=self.dtype)
 
         # Cast as ScalarFDTD casts it; the velocity coefficient stays a Python float, as there.
         self._src_coef = self.dtype.type(medium.density * medium.sound_speed**2 * self.dt)
@@ -1047,6 +1081,11 @@ class CScalarFDTD:
             velocity_cell=velocity_cell.ctypes.data_as(index_pointer),
             velocity_lower=velocity_lower.ctypes.data_as(index_pointer),
             velocity_difference=velocity_difference.ctypes.data_as(real_pointer),
+            x_open=self._open[0].ctypes.data_as(real_pointer),
+            y_open=self._open[1].ctypes.data_as(real_pointer),
+            z_open=self._open[2].ctypes.data_as(real_pointer),
+            p_keep=self._p_keep.ctypes.data_as(real_pointer),
+            has_rigid=int(self._has_rigid),
         )
         self._library.acfdtd_scalar_run(ctypes.byref(state))
         self.step_index += n_steps

@@ -224,8 +224,8 @@ typedef struct {
     REAL *current;
     REAL *previous;
 
-    /* Locally-reacting walls. When n_wall is 0 the room is rigid and the fast sweep runs; any wall
-     * at all switches to the exact sweep below. wall_a is a = c dt xi / (2 dx), already summed at
+    /* Locally-reacting walls. When n_wall is 0 the room is rigid and the fast sweep runs (unless
+     * there are obstacles); any wall at all switches to the exact sweep below. wall_a is a = c dt xi / (2 dx), already summed at
      * edges and corners; wall_scratch holds p^{n-1} at the wall cells, saved before the sweep
      * overwrites `previous`. */
     int64_t n_wall;
@@ -258,6 +258,18 @@ typedef struct {
     const int64_t *velocity_cell;
     const int64_t *velocity_lower;
     REAL *velocity_difference;
+
+    /* Rigid obstacles, as ac_fdtd.scalar.ScalarFDTD: a face is open (factor 1) iff neither of its
+     * two cells is solid, and every solid cell's new level is set to 0 at the end of the step.
+     * has_rigid is 1 only when the mask has a solid cell; it selects the exact sweep, since the
+     * fast one has no per-face factor. x_open is (nx-1)*ny*nz, y_open nx*(ny-1)*nz, z_open
+     * nx*ny*(nz-1), each C-ordered; p_keep is nx*ny*nz, 0 on solid cells. When has_rigid is 0
+     * these are placeholders and are never read. */
+    const REAL *x_open;
+    const REAL *y_open;
+    const REAL *z_open;
+    const REAL *p_keep;
+    int32_t has_rigid;
 } acfdtd_scalar;
 
 size_t acfdtd_scalar_struct_size(void) { return sizeof(acfdtd_scalar); }
@@ -309,19 +321,36 @@ static void scalar_sweep(const acfdtd_scalar *s, int32_t i_start, int32_t i_end)
  * to the cell below and subtracted from the cell above, axis by axis. With walls the contract is
  * bit-identity with the reference, so this sweep and the wall pass both go through
  * neumann_laplacian, which reproduces that order exactly: per axis in x, y, z order,
- * `+= (upper - here)` if an upper neighbour exists, then `-= (here - lower)` if a lower one does. */
+ * `+= (upper - here)` if an upper neighbour exists, then `-= (here - lower)` if a lower one does.
+ * With obstacles each difference is multiplied by its face's open factor first, as the reference
+ * multiplies its flux (`open * d` and `d * open` are the same product, and 0 or 1 is exact). */
 static inline REAL neumann_laplacian(const acfdtd_scalar *s, const REAL *cur, int32_t i, int32_t j,
                                      int32_t k) {
-    const int64_t stride_x = (int64_t)s->ny * s->nz;
-    const int64_t stride_y = s->nz;
+    const int32_t ny = s->ny, nz = s->nz;
+    const int64_t stride_x = (int64_t)ny * nz;
+    const int64_t stride_y = nz;
     const REAL here = cur[0];
     REAL lap = 0;
-    if (i < s->nx - 1) lap += cur[stride_x] - here;
-    if (i > 0) lap -= here - cur[-stride_x];
-    if (j < s->ny - 1) lap += cur[stride_y] - here;
-    if (j > 0) lap -= here - cur[-stride_y];
-    if (k < s->nz - 1) lap += cur[1] - here;
-    if (k > 0) lap -= here - cur[-1];
+    if (!s->has_rigid) {
+        if (i < s->nx - 1) lap += cur[stride_x] - here;
+        if (i > 0) lap -= here - cur[-stride_x];
+        if (j < ny - 1) lap += cur[stride_y] - here;
+        if (j > 0) lap -= here - cur[-stride_y];
+        if (k < nz - 1) lap += cur[1] - here;
+        if (k > 0) lap -= here - cur[-1];
+    } else {
+        /* The face above the cell along an axis shares the cell's index in that axis' face
+         * array; the face below is one step back along the axis. */
+        const int64_t fx = (int64_t)i * stride_x + (int64_t)j * nz + k;
+        const int64_t fy = ((int64_t)i * (ny - 1) + j) * nz + k;
+        const int64_t fz = ((int64_t)i * ny + j) * (nz - 1) + k;
+        if (i < s->nx - 1) lap += s->x_open[fx] * (cur[stride_x] - here);
+        if (i > 0) lap -= s->x_open[fx - stride_x] * (here - cur[-stride_x]);
+        if (j < ny - 1) lap += s->y_open[fy] * (cur[stride_y] - here);
+        if (j > 0) lap -= s->y_open[fy - nz] * (here - cur[-stride_y]);
+        if (k < nz - 1) lap += s->z_open[fz] * (cur[1] - here);
+        if (k > 0) lap -= s->z_open[fz - 1] * (here - cur[-1]);
+    }
     return lap;
 }
 
@@ -365,6 +394,14 @@ static void finish_scalar_walls(const acfdtd_scalar *s) {
     }
 }
 
+/* The reference's last act of a step with obstacles: `p_new[rigid] = 0`. A select rather than a
+ * product, so a solid cell is +0 whatever it held (a product would keep -0 or a NaN). */
+static void zero_rigid_pressure(const acfdtd_scalar *s, int32_t i_start, int32_t i_end) {
+    const int64_t plane = (int64_t)s->ny * s->nz;
+    for (int64_t c = (int64_t)i_start * plane; c < (int64_t)i_end * plane; c++)
+        if (s->p_keep[c] == 0) s->previous[c] = 0;
+}
+
 /* ------------------------------------------------------------------- the thread pool --- */
 
 /* One pool, shared by every kernel. A sweep is a function plus the range of planes to run it
@@ -402,6 +439,10 @@ static void wave_sweep(const void *state, int32_t start, int32_t end) {
 
 static void exact_wave_sweep(const void *state, int32_t start, int32_t end) {
     scalar_sweep_exact((const acfdtd_scalar *)state, start, end);
+}
+
+static void zero_rigid_sweep(const void *state, int32_t start, int32_t end) {
+    zero_rigid_pressure((const acfdtd_scalar *)state, start, end);
 }
 
 /* An equal share of the slowest axis each, so every thread owns one contiguous block of
@@ -584,7 +625,7 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
                 (lower >= 0) ? s->current[s->velocity_cell[r]] - s->current[lower] : (REAL)0;
         }
 
-        if (s->n_wall) {
+        if (s->n_wall || s->has_rigid) {
             /* Save p^{n-1} at the wall cells before the sweep overwrites `previous`. */
             for (int64_t w = 0; w < s->n_wall; w++)
                 s->wall_scratch[w] = s->previous[s->wall_index[w]];
@@ -606,6 +647,9 @@ void acfdtd_scalar_run(acfdtd_scalar *s) {
             const REAL delta = now - prev;
             if (delta != 0) s->previous[s->source_index[src]] += s->src_coef * delta;
         }
+
+        /* Last, after walls and sources: a source in a solid cell is undone here, as there. */
+        if (s->has_rigid) dispatch(s, zero_rigid_sweep, s->nx);
 
         REAL *swap = s->current;
         s->current = s->previous;
